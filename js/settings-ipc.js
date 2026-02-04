@@ -22,7 +22,7 @@ if (window.__TAURI__?.event?.listen) {
                 console.error('Error stopping keep-alive on process close:', error);
             });
         }
-        showProcessClosedError(data.message || 'CLIProxyAPI process has closed');
+        showProcessClosedError(data.message || 'CLIProxyAPI 进程已关闭');
     });
 
     window.__TAURI__.event.listen('process-exit-error', (event) => {
@@ -34,7 +34,7 @@ if (window.__TAURI__?.event?.listen) {
                 console.error('Error stopping keep-alive on process exit error:', error);
             });
         }
-        showProcessClosedError(`CLIProxyAPI process exited abnormally, exit code: ${errorData.code}`);
+        showProcessClosedError(`CLIProxyAPI 进程异常退出，退出码：${errorData.code}`);
     });
 
     window.__TAURI__.event.listen('cliproxyapi-restarted', (event) => {
@@ -46,6 +46,6 @@ if (window.__TAURI__?.event?.listen) {
                 console.error('Error starting keep-alive on process restart:', error);
             });
         }
-        showSuccessMessage('CLIProxyAPI process restarted successfully!');
+        showSuccessMessage('CLIProxyAPI 已重启');
     });
 }

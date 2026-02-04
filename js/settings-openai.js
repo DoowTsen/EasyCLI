@@ -28,7 +28,7 @@ async function loadOpenaiProviders() {
         renderOpenaiProviders();
     } catch (error) {
         console.error('Error loading OpenAI providers:', error);
-        showError('Failed to load OpenAI providers');
+        showError('加载 OpenAI 兼容提供商失败');
         renderOpenaiProviders();
     }
 }
@@ -42,8 +42,8 @@ function renderOpenaiProviders() {
         list.innerHTML = `
             <div class="empty-state">
                 <div class="empty-state-icon">🤖</div>
-                <div class="empty-state-text">No OpenAI Compatibility Providers</div>
-                <div class="empty-state-subtitle">Add your first provider to get started</div>
+                <div class="empty-state-text">暂无 OpenAI 兼容提供商</div>
+                <div class="empty-state-subtitle">添加第一个提供商开始使用</div>
             </div>
         `;
         return;
@@ -70,8 +70,8 @@ function renderOpenaiProviders() {
             </div>
         </div>
             <div class="openai-provider-actions">
-                <button class="openai-provider-btn edit" onclick="editOpenaiProvider(${index})">Edit</button>
-                <button class="openai-provider-btn delete" onclick="deleteOpenaiProvider(${index})">Delete</button>
+                <button class="openai-provider-btn edit" onclick="editOpenaiProvider(${index})">编辑</button>
+                <button class="openai-provider-btn delete" onclick="deleteOpenaiProvider(${index})">删除</button>
             </div>
         `;
         list.appendChild(providerItem);
@@ -80,7 +80,7 @@ function renderOpenaiProviders() {
 
 function showOpenaiProviderModal(editIndex = null) {
     currentProviderEditIndex = editIndex;
-    providerModalTitle.textContent = editIndex !== null ? 'Edit Provider' : 'Add Provider';
+    providerModalTitle.textContent = editIndex !== null ? '编辑提供商' : '添加提供商';
     providerNameInput.value = '';
     providerBaseUrlInput.value = '';
     providerHeadersInput.value = '';
@@ -197,8 +197,8 @@ function saveOpenaiProvider() {
 function editOpenaiProvider(index) { showOpenaiProviderModal(index); }
 function deleteOpenaiProvider(index) {
     showConfirmDialog(
-        'Confirm Delete',
-        'Are you sure you want to delete this OpenAI compatibility provider? This action cannot be undone.',
+        '确认删除',
+        '确定要删除该 OpenAI 兼容提供商吗？该操作无法撤销。',
         () => { openaiProviders.splice(index, 1); renderOpenaiProviders(); }
     );
 }

@@ -77,7 +77,7 @@ function validateProxyUrl(proxyUrl) {
 
     return {
         valid: false,
-        error: 'Invalid proxy format. Supported formats: http://host:port, https://host:port, socks5://host:port, http://user:pass@host:port, https://user:pass@host:port, socks5://user:pass@host:port'
+        error: '代理格式不正确。支持：http://host:port、https://host:port、socks5://host:port、http://user:pass@host:port、https://user:pass@host:port、socks5://user:pass@host:port'
     };
 }
 
@@ -103,7 +103,7 @@ updateCancelBtn.addEventListener('click', async () => {
         try {
             const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
             if (!startRes || !startRes.success) {
-                showError('CLIProxyAPI process start failed');
+                showError('CLIProxyAPI 启动失败');
                 return;
             }
             // Save the generated password for local mode HTTP requests
@@ -130,7 +130,7 @@ updateConfirmBtn.addEventListener('click', async () => {
     // User chose to update, start downloading
     try {
         continueBtn.disabled = true;
-        continueBtn.textContent = 'Updating...';
+        continueBtn.textContent = '更新中...';
 
         if (window.__TAURI__?.core?.invoke) {
             const proxyUrl = proxyInput.value.trim();
@@ -157,7 +157,7 @@ updateConfirmBtn.addEventListener('click', async () => {
                     try {
                         const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
                         if (!startRes || !startRes.success) {
-                            showError('CLIProxyAPI process start failed');
+                            showError('CLIProxyAPI 启动失败');
                             return;
                         }
                         // Save the generated password for local mode HTTP requests
@@ -178,15 +178,15 @@ updateConfirmBtn.addEventListener('click', async () => {
                     setTimeout(async () => { await openSettingsWindowPreferNew(); }, 800);
                 }
             } else {
-                showError('Failed to update CLIProxyAPI: ' + result.error);
+                showError('更新 CLIProxyAPI 失败：' + result.error);
             }
         }
     } catch (error) {
         console.error('Error updating CLIProxyAPI:', error);
-        showError('Error updating CLIProxyAPI: ' + error.message);
+        showError('更新 CLIProxyAPI 出错：' + error.message);
     } finally {
         continueBtn.disabled = false;
-        continueBtn.textContent = 'Connect';
+        continueBtn.textContent = '连接';
     }
 });
 
@@ -197,7 +197,7 @@ passwordCancelBtn.addEventListener('click', () => {
     passwordInput1.value = '';
     passwordInput2.value = '';
     // User cancelled, return to login page, do not start CLIProxyAPI
-    showError('Password must be set to use Local mode');
+    showError('本地模式必须设置管理密钥');
 });
 
 passwordSaveBtn.addEventListener('click', async () => {
@@ -206,29 +206,29 @@ passwordSaveBtn.addEventListener('click', async () => {
 
     // Validate password
     if (!password1) {
-        showError('Please enter password');
+        showError('请输入管理密钥');
         return;
     }
 
     if (!password2) {
-        showError('Please confirm password');
+        showError('请确认管理密钥');
         return;
     }
 
     if (password1 !== password2) {
-        showError('Passwords do not match');
+        showError('两次输入的管理密钥不一致');
         return;
     }
 
     if (password1.length < 6) {
-        showError('Password must be at least 6 characters');
+        showError('管理密钥至少需要 6 个字符');
         return;
     }
 
     try {
         // Disable save button
         passwordSaveBtn.disabled = true;
-        passwordSaveBtn.textContent = 'Saving...';
+        passwordSaveBtn.textContent = '保存中...';
 
         if (window.__TAURI__?.core?.invoke) {
             const result = await window.__TAURI__.core.invoke('update_secret_key', {
@@ -236,7 +236,7 @@ passwordSaveBtn.addEventListener('click', async () => {
             });
 
             if (result.success) {
-                showSuccess('Password set successfully!');
+                showSuccess('管理密钥设置成功！');
                 passwordDialog.classList.remove('show');
                 // Clear input fields
                 passwordInput1.value = '';
@@ -249,7 +249,7 @@ passwordSaveBtn.addEventListener('click', async () => {
                 try {
                     const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
                     if (!startRes || !startRes.success) {
-                        showError('CLIProxyAPI process start failed');
+                        showError('CLIProxyAPI 启动失败');
                         return;
                     }
                     // Save the generated password for local mode HTTP requests
@@ -263,13 +263,13 @@ passwordSaveBtn.addEventListener('click', async () => {
                 }
                 setTimeout(async () => { await openSettingsWindowPreferNew(); }, 600);
             } else {
-                showError('Failed to set password: ' + result.error);
+                showError('设置管理密钥失败：' + result.error);
             }
         }
     } catch (error) {
         console.error('Error setting password:', error);
         // Handle different error types
-        let errorMessage = 'Unknown error';
+        let errorMessage = '未知错误';
         if (error && typeof error === 'string') {
             errorMessage = error;
         } else if (error && error.message) {
@@ -277,11 +277,11 @@ passwordSaveBtn.addEventListener('click', async () => {
         } else if (error && error.toString) {
             errorMessage = error.toString();
         }
-        showError('Error setting password: ' + errorMessage);
+        showError('设置管理密钥出错：' + errorMessage);
     } finally {
         // Restore save button
         passwordSaveBtn.disabled = false;
-        passwordSaveBtn.textContent = 'Save';
+        passwordSaveBtn.textContent = '保存';
     }
 });
 
@@ -292,13 +292,13 @@ if (window.__TAURI__?.event?.listen) {
     window.__TAURI__.event.listen('process-start-error', (event) => {
         const errorData = event?.payload || {};
         console.error('CLIProxyAPI process start failed:', errorData);
-        showError(`Connection error: ${errorData.error}`);
-        if (errorData.reason) showError(`Reason: ${errorData.reason}`);
+        showError(`连接错误：${errorData.error}`);
+        if (errorData.reason) showError(`原因：${errorData.reason}`);
     });
     window.__TAURI__.event.listen('process-exit-error', (event) => {
         const errorData = event?.payload || {};
         console.error('CLIProxyAPI process exited abnormally:', errorData);
-        showError(`CLIProxyAPI process exited abnormally, exit code: ${errorData.code}`);
+        showError(`CLIProxyAPI 进程异常退出，退出码：${errorData.code}`);
     });
 }
 
@@ -333,7 +333,7 @@ function initializeFromLocalStorage() {
 }
 
 async function handleConnectClick() {
-    try { showSuccess('Connecting...'); } catch (_) { }
+    try { showSuccess('连接中...'); } catch (_) { }
     const localSelected = localCard.classList.contains('selected');
 
     if (localSelected) {
@@ -353,7 +353,7 @@ async function handleConnectClick() {
         try {
             // Disable button during check
             continueBtn.disabled = true;
-            continueBtn.textContent = 'Checking...';
+            continueBtn.textContent = '检查中...';
 
             // Save proxy URL to localStorage
             if (proxyUrl) {
@@ -370,7 +370,7 @@ async function handleConnectClick() {
                     if (result.needsUpdate) {
                         // Update needed, show update dialog
                         updateDialogMessage.textContent =
-                            `Current version: ${result.version}\nLatest version: ${result.latestVersion}\n\nDo you want to update to the latest version?`;
+                            `当前版本：${result.version}\n最新版本：${result.latestVersion}\n\n是否更新到最新版本？`;
                         updateDialog.classList.add('show');
 
                         // Save current path information
@@ -400,7 +400,7 @@ async function handleConnectClick() {
                             try {
                                 const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
                                 if (!startRes || !startRes.success) {
-                                    showError('CLIProxyAPI process start failed');
+                                    showError('CLIProxyAPI 启动失败');
                                     return;
                                 }
                                 // Save the generated password for local mode HTTP requests
@@ -416,19 +416,19 @@ async function handleConnectClick() {
                         }
                     }
                 } else {
-                    showError('Failed to check version: ' + result.error);
+                    showError('检查版本失败：' + result.error);
                 }
             } else {
                 // Fallback for non-Tauri environment
-                showError('This feature requires Tauri environment');
+                showError('该功能需要在 Tauri 环境中运行');
             }
         } catch (error) {
             console.error('Error checking version:', error);
-            showError('Error checking version: ' + error.message);
+            showError('检查版本出错：' + error.message);
         } finally {
             // Re-enable button
             continueBtn.disabled = false;
-            continueBtn.textContent = 'Connect';
+            continueBtn.textContent = '连接';
         }
         return;
     }
@@ -438,19 +438,19 @@ async function handleConnectClick() {
     const password = passwordInput.value.trim();
 
     if (!remoteUrl) {
-        showError('Please enter a remote URL');
+        showError('请输入远程地址');
         return;
     }
 
     if (!password) {
-        showError('Please enter a password');
+        showError('请输入管理密钥');
         return;
     }
 
     try {
         // Disable button during request
         continueBtn.disabled = true;
-        continueBtn.textContent = 'Connecting...';
+        continueBtn.textContent = '连接中...';
 
         // Save connection info to localStorage first
         localStorage.setItem('type', "remote");
@@ -476,9 +476,9 @@ async function handleConnectClick() {
             console.log('Connection successful, config loaded');
         } catch (error) {
             if (error.message.includes('401')) {
-                showError('Password incorrect');
+                showError('管理密钥错误');
             } else {
-                showError('Server address error');
+                showError('服务器地址错误');
             }
             return;
         }
@@ -490,11 +490,11 @@ async function handleConnectClick() {
 
     } catch (error) {
         console.error('Connection error:', error);
-        showError('Server address error');
+        showError('服务器地址错误');
     } finally {
         // Re-enable button
         continueBtn.disabled = false;
-        continueBtn.textContent = 'Connect';
+        continueBtn.textContent = '连接';
     }
 }
 
@@ -576,23 +576,23 @@ function handleDownloadStatus(statusData) {
     switch (statusData.status) {
         case 'checking':
             progressContainer.classList.add('show');
-            progressLabel.textContent = 'Checking version...';
+            progressLabel.textContent = '正在检查版本...';
             progressFill.style.width = '0%';
             progressText.textContent = '0%';
             break;
 
         case 'starting':
             progressContainer.classList.add('show');
-            progressLabel.textContent = 'Downloading CLIProxyAPI...';
+            progressLabel.textContent = '正在下载 CLIProxyAPI...';
             progressFill.style.width = '0%';
             progressText.textContent = '0%';
             break;
 
         case 'completed':
-            progressLabel.textContent = 'Download completed!';
+            progressLabel.textContent = '下载完成！';
             progressFill.style.width = '100%';
             progressText.textContent = '100%';
-            showSuccess(`CLIProxyAPI ${statusData.version} downloaded and extracted successfully!`);
+            showSuccess(`CLIProxyAPI ${statusData.version} 下载并解压完成！`);
 
             // Hide progress bar
             setTimeout(() => {
@@ -602,7 +602,7 @@ function handleDownloadStatus(statusData) {
 
         case 'latest':
             progressContainer.classList.remove('show');
-            showSuccess(`CLIProxyAPI ${statusData.version} is already the latest version!`);
+            showSuccess(`CLIProxyAPI ${statusData.version} 已是最新版本`);
             break;
 
         case 'update-available':
@@ -612,7 +612,7 @@ function handleDownloadStatus(statusData) {
 
         case 'failed':
             progressContainer.classList.remove('show');
-            showError('Operation failed: ' + statusData.error);
+            showError('操作失败：' + statusData.error);
             break;
     }
 }

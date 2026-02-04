@@ -25,7 +25,7 @@ async function loadAccessTokenKeys() {
         renderAccessTokenKeys();
     } catch (error) {
         console.error('Error loading Access Token keys:', error);
-        showError('Failed to load Access Token keys');
+        showError('加载访问令牌失败');
         renderAccessTokenKeys();
     }
 }
@@ -57,8 +57,8 @@ function renderAccessTokenKeysList(mode) {
         list.innerHTML = `
             <div class="empty-state">
                 <div class="empty-state-icon">🔑</div>
-                <div class="empty-state-text">No Access Tokens</div>
-                <div class="empty-state-subtitle">Add your first access token to get started</div>
+                <div class="empty-state-text">暂无访问令牌</div>
+                <div class="empty-state-subtitle">添加第一个访问令牌开始使用</div>
             </div>
         `;
         return;
@@ -73,8 +73,8 @@ function renderAccessTokenKeysList(mode) {
                 <div class="api-key-value">${key}</div>
             </div>
             <div class="api-key-actions">
-                <button class="api-key-btn edit" onclick="editAccessTokenKey(${index})">Edit</button>
-                <button class="api-key-btn delete" onclick="deleteAccessTokenKey(${index})">Delete</button>
+                <button class="api-key-btn edit" onclick="editAccessTokenKey(${index})">编辑</button>
+                <button class="api-key-btn delete" onclick="deleteAccessTokenKey(${index})">删除</button>
             </div>
         `;
         list.appendChild(keyItem);
@@ -84,7 +84,7 @@ function renderAccessTokenKeysList(mode) {
 function showAccessTokenModal(mode, editIndex = null) {
     currentAccessTokenMode = mode;
     currentAccessTokenEditIndex = editIndex;
-    accessTokenModalTitle.textContent = editIndex !== null ? 'Edit Access Token' : 'Add Access Token';
+    accessTokenModalTitle.textContent = editIndex !== null ? '编辑访问令牌' : '添加访问令牌';
     accessTokenInput.value = '';
     clearAccessTokenFormErrors();
     if (editIndex !== null) {
@@ -104,19 +104,19 @@ function saveAccessTokenKey() {
     const apiKey = accessTokenInput.value.trim();
     const currentTab = document.querySelector('.tab.active').getAttribute('data-tab');
     if (currentTab !== 'access-token') {
-        showError('Please switch to Access Token tab to manage access tokens');
+        showError('请切换到“访问令牌”页面进行管理');
         return;
     }
     clearAccessTokenFormErrors();
     let hasErrors = false;
     if (!apiKey) {
-        showAccessTokenFieldError(accessTokenInput, 'Please fill in this field');
+        showAccessTokenFieldError(accessTokenInput, '请填写此字段');
         hasErrors = true;
     }
     if (!hasErrors) {
         const isDuplicate = accessTokenKeys.some((key, index) => index !== currentAccessTokenEditIndex && key === apiKey);
         if (isDuplicate) {
-            showAccessTokenFieldError(accessTokenInput, 'This access token already exists');
+            showAccessTokenFieldError(accessTokenInput, '该访问令牌已存在');
             hasErrors = true;
         }
     }
@@ -147,8 +147,8 @@ function editAccessTokenKey(index) {
 
 function deleteAccessTokenKey(index) {
     showConfirmDialog(
-        'Confirm Delete',
-        'Are you sure you want to delete this access token?\nThis action cannot be undone.',
+        '确认删除',
+        '确定要删除该访问令牌吗？\n该操作无法撤销。',
         () => {
             accessTokenKeys.splice(index, 1);
             renderAccessTokenKeys();

@@ -2,6 +2,29 @@
 
 document.addEventListener('DOMContentLoaded', async () => {
     try {
+        // Footer: GitHub link + version
+        const githubLink = document.getElementById('github-link');
+        if (githubLink) {
+            githubLink.addEventListener('click', async (e) => {
+                e.preventDefault();
+                const url = 'https://github.com/DoowTsen/EasyCLI';
+                try {
+                    if (window.__TAURI__?.shell?.open) {
+                        await window.__TAURI__.shell.open(url);
+                        return;
+                    }
+                } catch (_) { }
+                try { window.open(url, '_blank'); } catch (_) { }
+            });
+        }
+        const appVersionText = document.getElementById('app-version-text');
+        if (appVersionText && window.__TAURI__?.app?.getVersion) {
+            try {
+                const v = await window.__TAURI__.app.getVersion();
+                if (v) appVersionText.textContent = `v${v}`;
+            } catch (_) { }
+        }
+
         const currentConfig = await getCurrentConfig();
         originalConfig = currentConfig;
         await initializeDebugSwitch();
@@ -33,7 +56,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     } catch (error) {
         console.error('Error initializing settings:', error);
-        showError('Failed to load settings');
+        showError('加载设置失败');
     }
 });
 

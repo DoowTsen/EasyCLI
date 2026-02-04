@@ -13,7 +13,7 @@ use rand::Rng;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -44,6 +44,19 @@ static KEEP_ALIVE_HANDLE: Lazy<Arc<Mutex<Option<(Arc<AtomicBool>, thread::JoinHa
 // Store the password used to start CLIProxyAPI for keep-alive authentication
 static CLI_PROXY_PASSWORD: Lazy<Arc<Mutex<Option<String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
+// In-memory capture of CPA stdout/stderr (tail only) for UI display
+static CPA_OUTPUT_TAIL: Lazy<Arc<Mutex<VecDeque<String>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(VecDeque::new())));
+const CPA_OUTPUT_MAX_LINES: usize = 3000;
+
+fn extract_secret_key(conf: &serde_yaml::Value) -> Option<String> {
+    conf.get("remote-management")
+        .and_then(|v| v.as_mapping())
+        .and_then(|m| m.get(&serde_yaml::Value::from("secret-key")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 #[derive(Error, Debug)]
 enum AppError {
@@ -771,7 +784,7 @@ fn read_local_auth_files() -> Result<serde_json::Value, String> {
                         .modified()
                         .ok()
                         .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| (d.as_millis() as u64))
+                        .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     result.push(json!({
                         "name": name,
@@ -828,6 +841,72 @@ fn upload_local_auth_files(files: Vec<UploadFile>) -> Result<serde_json::Value, 
     Ok(
         json!({"success": success>0, "successCount": success, "errorCount": error_count, "errors": if errors.is_empty(){serde_json::Value::Null}else{json!(errors)} }),
     )
+}
+
+#[tauri::command]
+fn upload_local_auth_files_from_paths(paths: Vec<String>) -> Result<serde_json::Value, String> {
+    let dir = app_dir().map_err(|e| e.to_string())?;
+    let p = dir.join("config.yaml");
+    if !p.exists() {
+        return Err("Configuration file does not exist".into());
+    }
+    let content = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    let conf: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
+    let auth_dir = conf
+        .get("auth-dir")
+        .and_then(|v| v.as_str())
+        .ok_or("auth-dir not configured in config.yaml")?;
+    let base = p.parent().unwrap();
+    let ad = resolve_path(auth_dir, Some(base));
+    fs::create_dir_all(&ad).map_err(|e| e.to_string())?;
+
+    let mut success = 0usize;
+    let mut error_count = 0usize;
+    let mut errors: Vec<String> = vec![];
+
+    for path_str in paths {
+        let path = PathBuf::from(path_str);
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                error_count += 1;
+                errors.push("invalid path".into());
+                continue;
+            }
+        };
+        if !name.to_lowercase().ends_with(".json") {
+            error_count += 1;
+            errors.push(format!("{}: not a .json file", name));
+            continue;
+        }
+        let dest = ad.join(&name);
+        if dest.exists() {
+            error_count += 1;
+            errors.push(format!("{}: File already exists", name));
+            continue;
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                if let Err(e) = fs::write(&dest, content.as_bytes()) {
+                    error_count += 1;
+                    errors.push(format!("{}: {}", name, e));
+                } else {
+                    success += 1;
+                }
+            }
+            Err(e) => {
+                error_count += 1;
+                errors.push(format!("{}: {}", name, e));
+            }
+        }
+    }
+
+    Ok(json!({
+        "success": success > 0,
+        "successCount": success,
+        "errorCount": error_count,
+        "errors": if errors.is_empty() { serde_json::Value::Null } else { json!(errors) }
+    }))
 }
 
 #[tauri::command]
@@ -912,6 +991,295 @@ fn generate_random_password() -> String {
             CHARSET[idx] as char
         })
         .collect()
+}
+
+fn kill_process_by_pid(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+}
+
+fn spawn_cliproxyapi_detached(exec: &Path, config: &Path, password: &str) -> Result<u32, String> {
+    println!("[CLIProxyAPI][START] exec: {}", exec.to_string_lossy());
+    println!(
+        "[CLIProxyAPI][START] args: -config {} --password {}",
+        config.to_string_lossy(),
+        password
+    );
+
+    let mut cmd = std::process::Command::new(exec);
+    cmd.args([
+        "-config",
+        config.to_string_lossy().as_ref(),
+        "--password",
+        password,
+    ]);
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On Unix systems, use process_group to detach from parent
+        unsafe {
+            cmd.pre_exec(|| {
+                // Create new process group (session leader)
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| {
+        eprintln!("[CLIProxyAPI][ERROR] failed to start process: {}", e);
+        e.to_string()
+    })?;
+
+    // Clear previous captured output on each (re)start
+    {
+        let mut buf = CPA_OUTPUT_TAIL.lock();
+        buf.clear();
+    }
+
+    let pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    fn push_line(prefix: &str, line: &str) {
+        let mut buf = CPA_OUTPUT_TAIL.lock();
+        let mut s = String::new();
+        s.push_str(prefix);
+        s.push_str(line.trim_end_matches(&['\r', '\n'][..]));
+        buf.push_back(s);
+        while buf.len() > CPA_OUTPUT_MAX_LINES {
+            buf.pop_front();
+        }
+    }
+
+    if let Some(out) = stdout {
+        thread::spawn(move || {
+            let reader = BufReader::new(out);
+            for line in reader.lines().flatten() {
+                push_line("[OUT] ", &line);
+            }
+        });
+    }
+    if let Some(err) = stderr {
+        thread::spawn(move || {
+            let reader = BufReader::new(err);
+            for line in reader.lines().flatten() {
+                push_line("[ERR] ", &line);
+            }
+        });
+    }
+
+    // Drop the child handle: process keeps running; stdout/stderr are drained by threads above.
+    drop(child);
+    Ok(pid)
+}
+
+#[tauri::command]
+fn get_cpa_output_tail(limit: Option<u32>) -> Result<serde_json::Value, String> {
+    let n = limit.unwrap_or(400).min(2000) as usize;
+    let buf = CPA_OUTPUT_TAIL.lock();
+    let len = buf.len();
+    let start = len.saturating_sub(n);
+    let lines: Vec<String> = buf.iter().skip(start).cloned().collect();
+    Ok(json!({ "lines": lines }))
+}
+
+#[tauri::command]
+fn clear_cpa_output_tail() -> Result<serde_json::Value, String> {
+    CPA_OUTPUT_TAIL.lock().clear();
+    Ok(json!({ "success": true }))
+}
+
+#[derive(Serialize)]
+struct LogFileMeta {
+    name: String,
+    size: u64,
+    modtime: u64,
+}
+
+fn read_file_tail_bytes(path: &Path, tail_bytes: u64) -> Result<String, String> {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
+    let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let read_len = tail_bytes.min(len);
+    let start = len.saturating_sub(read_len);
+    f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut buf = Vec::with_capacity(read_len as usize);
+    f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+#[tauri::command]
+fn list_error_log_files() -> Result<serde_json::Value, String> {
+    let dir = app_dir().map_err(|e| e.to_string())?;
+    let logs_dir = dir.join("logs");
+    if !logs_dir.exists() {
+        return Ok(json!({ "files": [] }));
+    }
+    let mut files: Vec<LogFileMeta> = vec![];
+    for entry in fs::read_dir(&logs_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if !name.to_lowercase().starts_with("error-") || !name.to_lowercase().ends_with(".log") {
+            continue;
+        }
+        let meta = entry.metadata().map_err(|e| e.to_string())?;
+        let mod_ms = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        files.push(LogFileMeta {
+            name,
+            size: meta.len(),
+            modtime: mod_ms,
+        });
+    }
+    files.sort_by(|a, b| b.modtime.cmp(&a.modtime));
+    Ok(json!({ "files": files }))
+}
+
+#[tauri::command]
+fn read_error_log_file(name: String, tail_bytes: Option<u64>) -> Result<serde_json::Value, String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("filename is empty".into());
+    }
+    if n.contains("..") || n.contains('/') || n.contains('\\') {
+        return Err("invalid filename".into());
+    }
+    let dir = app_dir().map_err(|e| e.to_string())?;
+    let path = dir.join("logs").join(n);
+    if !path.exists() {
+        return Err("file not found".into());
+    }
+    let text = read_file_tail_bytes(&path, tail_bytes.unwrap_or(400_000))?;
+    Ok(json!({ "name": n, "content": text }))
+}
+
+#[tauri::command]
+fn clear_all_error_logs() -> Result<serde_json::Value, String> {
+    let dir = app_dir().map_err(|e| e.to_string())?;
+    let logs_dir = dir.join("logs");
+    if !logs_dir.exists() {
+        return Ok(json!({ "success": true, "count": 0, "errorCount": 0, "errors": [] }));
+    }
+
+    let mut count: u32 = 0;
+    let mut errors: Vec<String> = vec![];
+    for entry in fs::read_dir(&logs_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let lower = name.to_lowercase();
+        if !lower.starts_with("error-") || !lower.ends_with(".log") {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(_) => count += 1,
+            Err(e) => errors.push(format!("{}: {}", name, e)),
+        };
+    }
+
+    Ok(json!({ "success": true, "count": count, "errorCount": errors.len(), "errors": errors }))
+}
+
+#[tauri::command]
+fn delete_error_log_file(name: String) -> Result<serde_json::Value, String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("filename is empty".into());
+    }
+    if n.contains("..") || n.contains('/') || n.contains('\\') {
+        return Err("invalid filename".into());
+    }
+    let lower = n.to_lowercase();
+    if !lower.starts_with("error-") || !lower.ends_with(".log") {
+        return Err("invalid log filename".into());
+    }
+    let dir = app_dir().map_err(|e| e.to_string())?;
+    let path = dir.join("logs").join(n);
+    if !path.exists() {
+        return Err("file not found".into());
+    }
+    fs::remove_file(&path).map_err(|e| e.to_string())?;
+    Ok(json!({ "success": true }))
+}
+
+fn restart_cliproxyapi_process(app: &tauri::AppHandle, port: u16, reason: &str) -> Result<u32, String> {
+    println!(
+        "[CLIProxyAPI][RESTART] Triggered by keep-alive. reason={} port={}",
+        reason, port
+    );
+
+    // Kill existing process if PID is stored
+    if let Some(pid) = *PROCESS_PID.lock() {
+        println!("[CLIProxyAPI][RESTART] Killing old process PID: {}", pid);
+        kill_process_by_pid(pid);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Also ensure the port is cleared (covers PID mismatch / orphan processes)
+    if let Err(e) = kill_process_on_port(port) {
+        eprintln!("[PORT_CLEANUP] Warning: {}", e);
+    }
+
+    let info = current_local_info().map_err(|e| e.to_string())?;
+    let (ver, path) = info.ok_or("Version file does not exist")?;
+    let exec = find_executable(&path).ok_or("Executable file does not exist")?;
+    let config = app_dir().map_err(|e| e.to_string())?.join("config.yaml");
+    if !config.exists() {
+        return Err("Configuration file does not exist".into());
+    }
+
+    let content = fs::read_to_string(&config).map_err(|e| e.to_string())?;
+    let conf: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
+    let password = extract_secret_key(&conf).ok_or("Missing remote-management.secret-key")?;
+
+    *CLI_PROXY_PASSWORD.lock() = Some(password.clone());
+
+    let pid = spawn_cliproxyapi_detached(&exec, &config, &password)?;
+    *PROCESS_PID.lock() = Some(pid);
+    println!("[CLIProxyAPI][RESTART] Detached process with PID: {}", pid);
+
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.emit(
+            "cliproxyapi-restarted",
+            json!({"version": ver, "pid": pid, "reason": reason}),
+        );
+    }
+
+    Ok(pid)
 }
 
 fn start_monitor(app: tauri::AppHandle) {
@@ -1095,7 +1463,38 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
                 .output();
             if let Ok(output) = output {
                 if String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()) {
-                    return Ok(json!({"success": true, "message": "already running"}));
+                    // Best-effort: still return the management key so the frontend can call management APIs.
+                    // Do NOT auto-generate/overwrite secret keys at runtime.
+                    let mut password: Option<String> = None;
+                    let mut port: Option<u16> = None;
+
+                    if let Ok(cfg_path) = app_dir().map(|p| p.join("config.yaml")) {
+                        if cfg_path.exists() {
+                            if let Ok(content) = fs::read_to_string(&cfg_path) {
+                                if let Ok(conf) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                                    port = conf
+                                        .get("port")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|v| v as u16);
+                                    password = extract_secret_key(&conf);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ref p) = password {
+                        *CLI_PROXY_PASSWORD.lock() = Some(p.clone());
+                    }
+                    if let Some(p) = port {
+                        let _ = start_keep_alive(app.clone(), p);
+                    }
+
+                    return Ok(json!({
+                        "success": true,
+                        "message": "already running",
+                        "pid": pid,
+                        "password": password
+                    }));
                 }
             }
         }
@@ -1103,7 +1502,36 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
         {
             unsafe {
                 if libc::kill(pid as i32, 0) == 0 {
-                    return Ok(json!({"success": true, "message": "already running"}));
+                    let mut password: Option<String> = None;
+                    let mut port: Option<u16> = None;
+
+                    if let Ok(cfg_path) = app_dir().map(|p| p.join("config.yaml")) {
+                        if cfg_path.exists() {
+                            if let Ok(content) = fs::read_to_string(&cfg_path) {
+                                if let Ok(conf) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                                    port = conf
+                                        .get("port")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|v| v as u16);
+                                    password = extract_secret_key(&conf);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ref p) = password {
+                        *CLI_PROXY_PASSWORD.lock() = Some(p.clone());
+                    }
+                    if let Some(p) = port {
+                        let _ = start_keep_alive(app.clone(), p);
+                    }
+
+                    return Ok(json!({
+                        "success": true,
+                        "message": "already running",
+                        "pid": pid,
+                        "password": password
+                    }));
                 }
             }
         }
@@ -1117,9 +1545,9 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
         return Err("Configuration file does not exist".into());
     }
 
-    // Read config, clean port, and prepare for update
+    // Read config and clean port
     let content = fs::read_to_string(&config).map_err(|e| e.to_string())?;
-    let mut conf: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
+    let conf: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
 
     let port = conf.get("port").and_then(|v| v.as_u64()).unwrap_or(8317) as u16;
 
@@ -1128,220 +1556,41 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
         eprintln!("[PORT_CLEANUP] Warning: {}", e);
     }
 
-    // Generate random password for local mode
-    let password = generate_random_password();
+    let password = extract_secret_key(&conf).ok_or("Missing remote-management.secret-key")?;
 
     // Store the password for keep-alive authentication
     *CLI_PROXY_PASSWORD.lock() = Some(password.clone());
 
-    // Ensure remote-management section exists
-    if !conf
-        .as_mapping()
-        .unwrap()
-        .contains_key(&serde_yaml::Value::from("remote-management"))
-    {
-        conf.as_mapping_mut().unwrap().insert(
-            serde_yaml::Value::from("remote-management"),
-            serde_yaml::Value::Mapping(Default::default()),
-        );
-    }
-
-    // Set the secret-key
-    let rm = conf
-        .as_mapping_mut()
-        .unwrap()
-        .get_mut(&serde_yaml::Value::from("remote-management"))
-        .unwrap()
-        .as_mapping_mut()
-        .unwrap();
-    rm.insert(
-        serde_yaml::Value::from("secret-key"),
-        serde_yaml::Value::from(password.as_str()),
-    );
-
-    // Write updated config
-    let updated_content = serde_yaml::to_string(&conf).map_err(|e| e.to_string())?;
-    fs::write(&config, updated_content).map_err(|e| e.to_string())?;
-
-    println!("[CLIProxyAPI][START] exec: {}", exec.to_string_lossy());
-    println!(
-        "[CLIProxyAPI][START] args: -config {} --password {}",
-        config.to_string_lossy(),
-        password
-    );
-    let mut cmd = std::process::Command::new(&exec);
-    cmd.args([
-        "-config",
-        config.to_string_lossy().as_ref(),
-        "--password",
-        &password,
-    ]);
-    #[cfg(target_os = "windows")]
-    {
-        cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // On Unix systems, use process_group to detach from parent
-        unsafe {
-            cmd.pre_exec(|| {
-                // Create new process group (session leader)
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| {
-        eprintln!("[CLIProxyAPI][ERROR] failed to start process: {}", e);
-        e.to_string()
-    })?;
-    // Don't track the child process - let it run independently
-    // Store PID for restart functionality
-    let pid = child.id();
+    let pid = spawn_cliproxyapi_detached(&exec, &config, &password)?;
     *PROCESS_PID.lock() = Some(pid);
     println!("[CLIProxyAPI][START] Detached process with PID: {}", pid);
-    // Drop child handle to fully detach
-    std::mem::drop(child);
     // Don't monitor - process is fully detached
     // Create tray icon when local process starts
     let _ = create_tray(&app);
 
     // Start keep-alive mechanism for Local mode
-    let config = read_config_yaml().unwrap_or(json!({}));
-    let port = config.get("port").and_then(|v| v.as_u64()).unwrap_or(8317) as u16;
-    let _ = start_keep_alive(port);
+    let _ = start_keep_alive(app.clone(), port);
 
-    Ok(json!({"success": true, "password": password}))
+    Ok(json!({"success": true, "password": password, "pid": pid}))
 }
 
 #[tauri::command]
 fn restart_cliproxyapi(app: tauri::AppHandle) -> Result<(), String> {
-    // Kill existing detached process if PID is stored
-    if let Some(pid) = *PROCESS_PID.lock() {
-        println!("[CLIProxyAPI][RESTART] Killing old process PID: {}", pid);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                .output();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    // Start new using current version
-    let info = current_local_info().map_err(|e| e.to_string())?;
-    let (ver, path) = info.ok_or("Version file does not exist")?;
-    let exec = find_executable(&path).ok_or("Executable file does not exist")?;
     let config = app_dir().map_err(|e| e.to_string())?.join("config.yaml");
     if !config.exists() {
         return Err("Configuration file does not exist".into());
     }
 
-    // Read config, clean port, and prepare for update
+    // Read config and clean port
     let content = fs::read_to_string(&config).map_err(|e| e.to_string())?;
-    let mut conf: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
+    let conf: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
 
     let port = conf.get("port").and_then(|v| v.as_u64()).unwrap_or(8317) as u16;
 
-    // Automatic port cleanup
-    if let Err(e) = kill_process_on_port(port) {
-        eprintln!("[PORT_CLEANUP] Warning: {}", e);
-    }
-
-    // Generate random password for local mode
-    let password = generate_random_password();
-
-    // Store the password for keep-alive authentication
-    *CLI_PROXY_PASSWORD.lock() = Some(password.clone());
-
-    // Ensure remote-management section exists
-    if !conf
-        .as_mapping()
-        .unwrap()
-        .contains_key(&serde_yaml::Value::from("remote-management"))
-    {
-        conf.as_mapping_mut().unwrap().insert(
-            serde_yaml::Value::from("remote-management"),
-            serde_yaml::Value::Mapping(Default::default()),
-        );
-    }
-
-    // Set the secret-key
-    let rm = conf
-        .as_mapping_mut()
-        .unwrap()
-        .get_mut(&serde_yaml::Value::from("remote-management"))
-        .unwrap()
-        .as_mapping_mut()
-        .unwrap();
-    rm.insert(
-        serde_yaml::Value::from("secret-key"),
-        serde_yaml::Value::from(password.as_str()),
-    );
-
-    // Write updated config
-    let updated_content = serde_yaml::to_string(&conf).map_err(|e| e.to_string())?;
-    fs::write(&config, updated_content).map_err(|e| e.to_string())?;
-
-    println!("[CLIProxyAPI][RESTART] exec: {}", exec.to_string_lossy());
-    println!(
-        "[CLIProxyAPI][RESTART] args: -config {} --password {}",
-        config.to_string_lossy(),
-        password
-    );
-    let mut cmd = std::process::Command::new(&exec);
-    cmd.args([
-        "-config",
-        config.to_string_lossy().as_ref(),
-        "--password",
-        &password,
-    ]);
-    #[cfg(target_os = "windows")]
-    {
-        cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // On Unix systems, use process_group to detach from parent
-        unsafe {
-            cmd.pre_exec(|| {
-                // Create new process group (session leader)
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| {
-        eprintln!("[CLIProxyAPI][ERROR] failed to restart process: {}", e);
-        e.to_string()
-    })?;
-    // Store PID and drop child handle to fully detach
-    let pid = child.id();
-    *PROCESS_PID.lock() = Some(pid);
-    println!("[CLIProxyAPI][RESTART] Detached process with PID: {}", pid);
-    std::mem::drop(child);
+    let _pid = restart_cliproxyapi_process(&app, port, "manual")?;
 
     // Start keep-alive mechanism for Local mode
-    let config = read_config_yaml().unwrap_or(json!({}));
-    let port = config.get("port").and_then(|v| v.as_u64()).unwrap_or(8317) as u16;
-    let _ = start_keep_alive(port);
-
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.emit("cliproxyapi-restarted", json!({"version": ver}));
-    }
+    let _ = start_keep_alive(app.clone(), port);
     Ok(())
 }
 
@@ -1359,6 +1608,7 @@ fn stop_process_internal() {
 fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::{
         menu::{MenuBuilder, MenuItemBuilder},
+        tray::TrayIconEvent,
         tray::TrayIconBuilder,
     };
     let mut guard = TRAY_ICON.lock();
@@ -1375,6 +1625,11 @@ fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(true)
         .tooltip("EasyCLI")
+        .on_tray_icon_event(|tray, event| {
+            if matches!(event, TrayIconEvent::DoubleClick { .. }) {
+                let _ = open_settings_window(tray.app_handle().clone());
+            }
+        })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open_settings" => {
                 let _ = open_settings_window(app.clone());
@@ -1600,6 +1855,7 @@ fn stop_callback_server(listen_port: u16) -> Result<serde_json::Value, String> {
 fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
     // If settings window already exists (predefined in config), just show and focus it
     if let Some(win) = app.get_webview_window("settings") {
+        let _ = win.center();
         let _ = win.show();
         let _ = win.set_focus();
         // Ensure Dock icon is visible while settings is open (macOS only)
@@ -1628,6 +1884,7 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
         .resizable(false)
         .build()
         .map_err(|e| e.to_string())?;
+    let _ = win.center();
     let _ = win.show();
     let _ = win.set_focus();
     // Ensure Dock icon is visible while settings is open (macOS only)
@@ -1652,6 +1909,7 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
 fn open_login_window(app: tauri::AppHandle) -> Result<(), String> {
     // If login window already exists (predefined in config), show and focus it
     if let Some(win) = app.get_webview_window("main") {
+        let _ = win.center();
         let _ = win.show();
         let _ = win.set_focus();
         // Close settings window shortly after to ensure clean state
@@ -1673,6 +1931,7 @@ fn open_login_window(app: tauri::AppHandle) -> Result<(), String> {
         .resizable(false)
         .build()
         .map_err(|e| e.to_string())?;
+    let _ = win.center();
     let _ = win.show();
     let _ = win.set_focus();
 
@@ -1894,6 +2153,19 @@ fn disable_auto_start() -> Result<serde_json::Value, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .setup(|app| {
+            // Center windows on first launch (especially important for fixed-size windows).
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.center();
+                // Avoid initial "jump": the main window is configured as invisible, so we show it only after centering.
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+            if let Some(win) = app.get_webview_window("settings") {
+                let _ = win.center();
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let has_tray = TRAY_ICON.lock().is_some();
@@ -1932,10 +2204,17 @@ fn main() {
             update_config_yaml,
             read_local_auth_files,
             upload_local_auth_files,
+            upload_local_auth_files_from_paths,
             delete_local_auth_files,
             download_local_auth_files,
             restart_cliproxyapi,
             start_cliproxyapi,
+            get_cpa_output_tail,
+            clear_cpa_output_tail,
+            list_error_log_files,
+            read_error_log_file,
+            clear_all_error_logs,
+            delete_error_log_file,
             open_settings_window,
             open_login_window,
             start_callback_server,
@@ -1993,51 +2272,107 @@ fn save_files_to_directory(files: Vec<SaveFile>) -> Result<serde_json::Value, St
 
 // Keep-alive mechanism functions
 
-fn run_keep_alive_loop(stop: Arc<AtomicBool>, port: u16, password: String) {
-    thread::spawn(move || {
-        println!("[KEEP-ALIVE] Starting keep-alive loop for port {}", port);
+fn run_keep_alive_loop(stop: Arc<AtomicBool>, app: tauri::AppHandle, port: u16, mut password: String) {
+    println!("[KEEP-ALIVE] Starting keep-alive loop for port {}", port);
 
-        // Create a tokio runtime for async operations
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                println!("[KEEP-ALIVE] Failed to create tokio runtime: {}", e);
-                return;
-            }
-        };
+    // Create a tokio runtime for async operations
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            println!("[KEEP-ALIVE] Failed to create tokio runtime: {}", e);
+            return;
+        }
+    };
 
-        while !stop.load(Ordering::SeqCst) {
-            // Send keep-alive request
-            let keep_alive_url = format!("http://127.0.0.1:{}/keep-alive", port);
-            let password_clone = password.clone();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[KEEP-ALIVE] Failed to build HTTP client: {}", e);
+            return;
+        }
+    };
 
-            let result = rt.block_on(async {
-                println!("[KEEP-ALIVE] Sending request to: {}", keep_alive_url);
-                println!(
-                    "[KEEP-ALIVE] Using password: {}...",
-                    &password_clone[..8.min(password_clone.len())]
-                );
-                reqwest::Client::new()
-                    .get(&keep_alive_url)
-                    .header("Authorization", format!("Bearer {}", &password_clone))
-                    .header("Content-Type", "application/json")
-                    .send()
-                    .await
-            });
+    let mut consecutive_failures: u32 = 0;
+    let mut last_restart = std::time::Instant::now() - Duration::from_secs(3600);
 
-            match result {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        println!("[KEEP-ALIVE] Request successful");
-                    } else {
-                        println!("[KEEP-ALIVE] Request failed: {}", response.status());
+    while !stop.load(Ordering::SeqCst) {
+        // Send keep-alive request
+        let keep_alive_url = format!("http://127.0.0.1:{}/keep-alive", port);
+        let password_clone = password.clone();
+
+        let result = rt.block_on(async {
+            println!("[KEEP-ALIVE] Sending request to: {}", keep_alive_url);
+            println!(
+                "[KEEP-ALIVE] Using password: {}...",
+                &password_clone[..8.min(password_clone.len())]
+            );
+            client
+                .get(&keep_alive_url)
+                .header("Authorization", format!("Bearer {}", &password_clone))
+                .header("Content-Type", "application/json")
+                .send()
+                .await
+        });
+
+        let mut should_restart = false;
+        match result {
+            Ok(response) => {
+                if response.status().is_success() {
+                    consecutive_failures = 0;
+                    println!("[KEEP-ALIVE] Request successful");
+                } else {
+                    let status = response.status();
+                    println!("[KEEP-ALIVE] Request failed: {}", status);
+
+                    // Auth changed (e.g. user updated secret-key): reload from config once.
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
+                    {
+                        if let Ok(dir) = app_dir() {
+                            let p = dir.join("config.yaml");
+                            if let Ok(content) = fs::read_to_string(&p) {
+                                if let Ok(conf) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                                    if let Some(sk) = extract_secret_key(&conf) {
+                                        if sk != password {
+                                            println!("[KEEP-ALIVE] Detected secret-key change, reloading");
+                                            password = sk.clone();
+                                            *CLI_PROXY_PASSWORD.lock() = Some(sk);
+                                            consecutive_failures = 0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if status.is_server_error() || status == reqwest::StatusCode::BAD_GATEWAY {
+                        consecutive_failures += 1;
                     }
                 }
-                Err(e) => {
-                    println!("[KEEP-ALIVE] Request error: {}", e);
-                }
             }
+            Err(e) => {
+                consecutive_failures += 1;
+                println!("[KEEP-ALIVE] Request error: {}", e);
+            }
+        }
 
+        if consecutive_failures >= 3 && last_restart.elapsed() > Duration::from_secs(30) {
+            should_restart = true;
+        }
+
+        if should_restart {
+            consecutive_failures = 0;
+            last_restart = std::time::Instant::now();
+            let _ = restart_cliproxyapi_process(&app, port, "keep-alive failures");
+            // Give the process a moment to come back up.
+            for _ in 0..20 {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        } else {
             // Wait 5 seconds before next request
             for _ in 0..50 {
                 if stop.load(Ordering::SeqCst) {
@@ -2046,13 +2381,13 @@ fn run_keep_alive_loop(stop: Arc<AtomicBool>, port: u16, password: String) {
                 thread::sleep(Duration::from_millis(100));
             }
         }
+    }
 
-        println!("[KEEP-ALIVE] Keep-alive loop stopped");
-    });
+    println!("[KEEP-ALIVE] Keep-alive loop stopped");
 }
 
 #[tauri::command]
-fn start_keep_alive(port: u16) -> Result<serde_json::Value, String> {
+fn start_keep_alive(app: tauri::AppHandle, port: u16) -> Result<serde_json::Value, String> {
     // Stop existing keep-alive if running
     stop_keep_alive_internal();
 
@@ -2064,9 +2399,10 @@ fn start_keep_alive(port: u16) -> Result<serde_json::Value, String> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
+    let app_clone = app.clone();
 
     let handle = thread::spawn(move || {
-        run_keep_alive_loop(stop_clone, port, password);
+        run_keep_alive_loop(stop_clone, app_clone, port, password);
     });
 
     *KEEP_ALIVE_HANDLE.lock() = Some((stop, handle));

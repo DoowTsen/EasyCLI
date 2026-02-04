@@ -6,6 +6,29 @@ EasyCLI is a Tauri v2-based desktop GUI for managing and operating CLIProxyAPI i
 
 Upstream project: https://github.com/luispater/CLIProxyAPI
 
+## Doow Edition Updates (based on https://github.com/router-for-me/EasyCLI)
+This repo includes additional updates built on top of https://github.com/router-for-me/EasyCLI (Doow edition).
+
+- Password behavior (Local CPA)
+  - No longer overwrites `remote-management.secret-key` on startup; CPA starts with the key from config.
+  - Keep-alive is more resilient: repeated failures (including `502 Bad Gateway`) trigger an automatic CPA restart (with throttling).
+- CPA process & windows
+  - Tray icon double-click opens the Settings window.
+  - First launch centers windows without the “show then jump to center” effect (main window is shown after centering).
+- Quota Management tab
+  - Added a unified Quota page with card-style display and improved readability (management-like styling).
+  - Supports Gemini / Codex / Antigravity quotas, with view switching (Model / Management / JSON) and one-click copy in JSON mode.
+  - Antigravity Model view supports “Recommended / All” filtering and covers `imageGenerationModelIds`.
+- CPA Config tab (renamed from “Config Management”)
+  - Added in-app config editor (load / edit / search / copy / save) via CPA management endpoints.
+- Logs tab
+  - “CLIProxyAPI output” viewer: tail, auto-refresh, copy, and clear.
+  - “Error logs” viewer: list/select, tail view, copy, delete current file, and delete all log files.
+- Maintenance actions
+  - Buttons to: open `.../management.html`, update CPA (download/install flow), and restart CPA.
+- Auth files UX
+  - Drag-and-drop upload for auth JSON files (Tauri drag-drop events on desktop).
+
 ## Features
 - Local and Remote modes with quick switching.
 - Auto-detect, download, and extract the latest CLIProxyAPI release per OS/arch.

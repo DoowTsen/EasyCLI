@@ -94,16 +94,16 @@ function updateServerStatus() {
     const connectionType = localStorage.getItem('type') || 'local';
 
     if (connectionType === 'local') {
-        serverStatusText.innerHTML = '<span style="color: #10b981;">●</span> Local';
+        serverStatusText.innerHTML = '<span style="color: #10b981;">●</span> 本地';
     } else {
         configManager.refreshConnection();
         const storedBaseUrl = localStorage.getItem('base-url');
         const baseUrl = storedBaseUrl || configManager.baseUrl;
 
         if (baseUrl) {
-            serverStatusText.innerHTML = `Remote:<br><span style="color: #10b981;">●</span> ${baseUrl}`;
+            serverStatusText.innerHTML = `远程：<br><span style="color: #10b981;">●</span> ${baseUrl}`;
         } else {
-            serverStatusText.innerHTML = 'Remote:<br><span style="color: #10b981;">●</span> Unknown';
+            serverStatusText.innerHTML = '远程：<br><span style="color: #10b981;">●</span> 未知';
         }
     }
 }
@@ -158,24 +158,24 @@ autoStartSwitch.addEventListener('change', async () => {
             if (autoStartSwitch.checked) {
                 const result = await window.__TAURI__.core.invoke('enable_auto_start');
                 if (result.success) {
-                    showSuccessMessage('Auto-start enabled successfully');
+                    showSuccessMessage('已启用开机自启动');
                 } else {
-                    showError('Failed to enable auto-start');
+                    showError('启用开机自启动失败');
                     autoStartSwitch.checked = false;
                 }
             } else {
                 const result = await window.__TAURI__.core.invoke('disable_auto_start');
                 if (result.success) {
-                    showSuccessMessage('Auto-start disabled successfully');
+                    showSuccessMessage('已关闭开机自启动');
                 } else {
-                    showError('Failed to disable auto-start');
+                    showError('关闭开机自启动失败');
                     autoStartSwitch.checked = true;
                 }
             }
         }
     } catch (error) {
         console.error('Error toggling auto-start:', error);
-        showError('Failed to update auto-start setting');
+        showError('更新开机自启动设置失败');
         // Revert the toggle
         autoStartSwitch.checked = !autoStartSwitch.checked;
     }
@@ -205,7 +205,7 @@ async function updateSetting(endpoint, value, isDelete = false) {
 // Apply settings for the current tab
 async function applyAllSettings() {
     applyBtn.disabled = true;
-    applyBtn.textContent = 'Applying...';
+    applyBtn.textContent = '应用中...';
 
     try {
         const serverConfig = await getCurrentConfig();
@@ -307,9 +307,9 @@ async function applyAllSettings() {
         }
 
         if (changes.length === 0) {
-            const tabName = currentTab === 'basic' ? 'Basic Settings' :
-                currentTab === 'api' ? 'Third Party API Keys' : 'Settings';
-            showSuccessMessage(`No changes to apply in ${tabName.toLowerCase()}`);
+            const tabName = currentTab === 'basic' ? '基础设置' :
+                currentTab === 'api' ? '第三方 API Keys' : '设置';
+            showSuccessMessage(`${tabName}没有可应用的更改`);
         } else if (successCount === changes.length) {
             const updatedConfig = await getCurrentConfig();
             originalConfig = updatedConfig;
@@ -329,28 +329,28 @@ async function applyAllSettings() {
                 await loadOpenaiProviders();
             }
 
-            const tabName = currentTab === 'basic' ? 'Basic Settings' :
-                currentTab === 'access-token' ? 'Access Token' :
-                    currentTab === 'api' ? 'Third Party API Keys' :
-                        currentTab === 'openai' ? 'OpenAI Compatibility' : 'Settings';
-            showSuccessMessage(`Applied ${successCount} ${tabName.toLowerCase()} setting(s) successfully`);
+            const tabName = currentTab === 'basic' ? '基础设置' :
+                currentTab === 'access-token' ? '访问令牌' :
+                    currentTab === 'api' ? '第三方 API Keys' :
+                        currentTab === 'openai' ? 'OpenAI 兼容' : '设置';
+            showSuccessMessage(`已成功应用 ${successCount} 项${tabName}`);
 
             if (portChanged && localStorage.getItem('type') === 'local') {
                 console.log('Port configuration has changed, need to restart CLIProxyAPI process');
-                showSuccessMessage('Port configuration saved, restarting CLIProxyAPI process...');
+                showSuccessMessage('端口配置已保存，正在重启 CLIProxyAPI...');
                 if (window.__TAURI__?.core?.invoke) {
                     window.__TAURI__.core.invoke('restart_cliproxyapi');
                 }
             }
         } else {
-            showError(`Failed to apply ${changes.length - successCount} setting(s)`);
+            showError(`应用失败：${changes.length - successCount} 项设置未能保存`);
         }
     } catch (error) {
         console.error('Error applying settings:', error);
-        showError('Network error');
+        showError('网络错误');
     } finally {
         applyBtn.disabled = false;
-        applyBtn.textContent = 'Apply';
+        applyBtn.textContent = '应用';
     }
 }
 
@@ -408,14 +408,14 @@ async function resetAllSettings() {
         }
 
         originalConfig = serverConfig;
-        const tabName = currentTab === 'basic' ? 'Basic Settings' :
-            currentTab === 'access-token' ? 'Access Token' :
-                currentTab === 'api' ? 'Third Party API Keys' :
-                    currentTab === 'openai' ? 'OpenAI Compatibility' : 'Settings';
-        showSuccessMessage(`${tabName} reset to server config`);
+        const tabName = currentTab === 'basic' ? '基础设置' :
+            currentTab === 'access-token' ? '访问令牌' :
+                currentTab === 'api' ? '第三方 API Keys' :
+                    currentTab === 'openai' ? 'OpenAI 兼容' : '设置';
+        showSuccessMessage(`${tabName} 已重置为服务端配置`);
     } catch (error) {
         console.error('Error resetting settings:', error);
-        showError('Failed to reset settings');
+        showError('重置失败');
     }
 }
 

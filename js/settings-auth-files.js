@@ -5,16 +5,86 @@ const selectAllBtn = document.getElementById('select-all-btn');
 const deleteBtn = document.getElementById('delete-btn');
 const authFilesList = document.getElementById('auth-files-list');
 const authLoading = document.getElementById('auth-loading');
+const authFilesContainer = document.querySelector('#auth-content .auth-files-container');
 
 // New dropdown elements
 const newDropdown = document.getElementById('new-dropdown');
 const newBtn = document.getElementById('new-btn');
 const dropdownMenu = document.getElementById('dropdown-menu');
 const downloadBtn = document.getElementById('download-btn');
+const refreshBtn = document.getElementById('refresh-btn');
 
 // State
 let selectedAuthFiles = new Set();
 let authFiles = [];
+
+// Drag & drop upload overlay for auth files
+let authDropOverlay = null;
+let authDragDepth = 0;
+
+function ensureAuthDropOverlay() {
+    if (authDropOverlay || !authFilesContainer) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'auth-drop-overlay';
+    overlay.innerHTML = `
+        <div>
+            <div class="auth-drop-title">拖拽认证文件到这里上传</div>
+            <div class="auth-drop-sub">支持 .json（可多选）</div>
+        </div>
+    `;
+    authFilesContainer.appendChild(overlay);
+    authDropOverlay = overlay;
+}
+
+function isAuthTabActive() {
+    return document.querySelector('.tab.active')?.getAttribute('data-tab') === 'auth';
+}
+
+function showAuthDropOverlay() {
+    ensureAuthDropOverlay();
+    if (!authDropOverlay) return;
+    authDropOverlay.classList.add('show');
+}
+
+function hideAuthDropOverlay() {
+    if (!authDropOverlay) return;
+    authDropOverlay.classList.remove('show');
+}
+
+async function handleDroppedAuthFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    const invalid = files.filter(f => !String(f?.name || '').toLowerCase().endsWith('.json'));
+    if (invalid.length) {
+        showError(`只支持 .json 文件：${invalid.map(f => f.name).join(', ')}`);
+        return;
+    }
+    await uploadFilesToServer(files);
+    await loadAuthFiles();
+}
+
+async function uploadAuthFilesFromTauriPaths(paths) {
+    if (!window.__TAURI__?.core?.invoke) {
+        throw new Error('Tauri 环境不可用');
+    }
+    const type = localStorage.getItem('type') || 'local';
+    if (type !== 'local') {
+        throw new Error('远程模式暂不支持拖拽上传，请使用“新建 -> 本地文件”上传');
+    }
+    const list = Array.isArray(paths) ? paths : [];
+    if (list.length === 0) return;
+    const result = await window.__TAURI__.core.invoke('upload_local_auth_files_from_paths', { paths: list });
+    if (result?.success && result?.successCount > 0) {
+        typeof showSuccessMessage === 'function' && showSuccessMessage(`Uploaded ${result.successCount} file(s) successfully`);
+    }
+    if (result?.errorCount > 0) {
+        const errors = Array.isArray(result?.errors) ? result.errors : [];
+        const msg = errors.length && errors.length <= 3
+            ? `Failed to upload ${result.errorCount} file(s): ${errors.join(', ')}`
+            : `Failed to upload ${result.errorCount} file(s)`;
+        showError(msg);
+    }
+}
 
 // Load auth files from server
 async function loadAuthFiles() {
@@ -24,7 +94,7 @@ async function loadAuthFiles() {
         updateActionButtons();
     } catch (error) {
         console.error('Error loading auth files:', error);
-        showError('Network error');
+        showError('网络错误');
         showEmptyAuthFiles();
         updateActionButtons();
     }
@@ -50,9 +120,9 @@ function renderAuthFiles() {
             <div class="auth-file-info">
                 <div class="auth-file-name">${file.name}</div>
                 <div class="auth-file-details">
-                    <span class="auth-file-type">Type: ${file.type || 'unknown'}</span>
+                    <span class="auth-file-type">类型：${file.type || 'unknown'}</span>
                     <span class="auth-file-size">${fileSize}</span>
-                    <span>Modified: ${modTime}</span>
+                    <span>修改时间：${modTime}</span>
                 </div>
             </div>
         `;
@@ -68,8 +138,8 @@ function showEmptyAuthFiles() {
     authFilesList.innerHTML = `
         <div class="empty-state">
             <div class="empty-state-icon">📁</div>
-            <div class="empty-state-text">No authentication files</div>
-            <div class="empty-state-subtitle">Upload authentication files to manage them here</div>
+            <div class="empty-state-text">暂无认证文件</div>
+            <div class="empty-state-subtitle">上传认证文件后即可在此管理</div>
         </div>
     `;
     updateActionButtons();
@@ -95,16 +165,42 @@ function updateActionButtons() {
     if (currentTab === 'auth') {
         resetBtn.style.display = 'none';
         applyBtn.style.display = 'none';
+        if (refreshBtn) refreshBtn.style.display = 'none';
         selectAllBtn.style.display = 'block';
         deleteBtn.style.display = 'block';
         newDropdown.style.display = 'block';
         downloadBtn.style.display = 'block';
-        selectAllBtn.textContent = allSelected ? 'Unselect All' : 'Select All';
+        selectAllBtn.textContent = allSelected ? '取消全选' : '全选';
         deleteBtn.disabled = !hasSelection;
         downloadBtn.disabled = !hasSelection;
+    } else if (currentTab === 'quota') {
+        resetBtn.style.display = 'none';
+        applyBtn.style.display = 'none';
+        if (refreshBtn) refreshBtn.style.display = 'block';
+        selectAllBtn.style.display = 'none';
+        deleteBtn.style.display = 'none';
+        newDropdown.style.display = 'none';
+        downloadBtn.style.display = 'none';
+    } else if (currentTab === 'config') {
+        resetBtn.style.display = 'none';
+        applyBtn.style.display = 'none';
+        if (refreshBtn) refreshBtn.style.display = 'none';
+        selectAllBtn.style.display = 'none';
+        deleteBtn.style.display = 'none';
+        newDropdown.style.display = 'none';
+        downloadBtn.style.display = 'none';
+    } else if (currentTab === 'logs') {
+        resetBtn.style.display = 'none';
+        applyBtn.style.display = 'none';
+        if (refreshBtn) refreshBtn.style.display = 'none';
+        selectAllBtn.style.display = 'none';
+        deleteBtn.style.display = 'none';
+        newDropdown.style.display = 'none';
+        downloadBtn.style.display = 'none';
     } else if (currentTab === 'access-token' || currentTab === 'api' || currentTab === 'openai' || currentTab === 'basic') {
         resetBtn.style.display = 'block';
         applyBtn.style.display = 'block';
+        if (refreshBtn) refreshBtn.style.display = 'none';
         selectAllBtn.style.display = 'none';
         deleteBtn.style.display = 'none';
         newDropdown.style.display = 'none';
@@ -130,32 +226,32 @@ function toggleSelectAllAuthFiles() {
 async function deleteSelectedAuthFiles() {
     if (selectedAuthFiles.size === 0 || deleteBtn.disabled) return;
     const fileCount = selectedAuthFiles.size;
-    const fileText = fileCount === 1 ? 'file' : 'files';
+    const fileText = '个文件';
     showConfirmDialog(
-        'Confirm Delete',
-        `Are you sure you want to delete ${fileCount} authentication ${fileText}?\nThis action cannot be undone.`,
+        '确认删除',
+        `确定要删除 ${fileCount} ${fileText} 吗？\n该操作无法撤销。`,
         async () => {
             deleteBtn.disabled = true;
-            deleteBtn.textContent = 'Deleting...';
+            deleteBtn.textContent = '删除中...';
             try {
                 const result = await configManager.deleteAuthFiles(Array.from(selectedAuthFiles));
                 if (result.success) {
-                    showSuccessMessage(`Deleted ${result.successCount} file(s) successfully`);
+                    showSuccessMessage(`已删除 ${result.successCount} 个文件`);
                     selectedAuthFiles.clear();
                     await loadAuthFiles();
                 } else {
                     if (result.error) {
                         showError(result.error);
                     } else {
-                        showError(`Failed to delete ${result.errorCount} file(s)`);
+                        showError(`删除失败：${result.errorCount} 个文件`);
                     }
                 }
             } catch (error) {
                 console.error('Error deleting auth files:', error);
-                showError('Network error');
+                showError('网络错误');
             } finally {
                 deleteBtn.disabled = false;
-                deleteBtn.textContent = 'Delete';
+                deleteBtn.textContent = '删除';
                 updateActionButtons();
             }
         }
@@ -183,7 +279,7 @@ function createNewAuthFile(type) {
         'vertex': 'Vertex',
         'iflow': 'iFlow',
         'antigravity': 'Antigravity',
-        'local': 'Local File'
+        'local': '本地文件'
     };
 
     if (type === 'local') {
@@ -363,24 +459,24 @@ async function uploadSingleFile(file, apiUrl, password) {
 async function downloadSelectedAuthFiles() {
     if (selectedAuthFiles.size === 0 || downloadBtn.disabled) return;
     downloadBtn.disabled = true;
-    downloadBtn.textContent = 'Downloading...';
+    downloadBtn.textContent = '下载中...';
     try {
         const result = await configManager.downloadAuthFiles(Array.from(selectedAuthFiles));
         if (result.success && result.successCount > 0) {
-            showSuccessMessage(`Downloaded ${result.successCount} file(s) successfully`);
+            showSuccessMessage(`已下载 ${result.successCount} 个文件`);
         }
         if (result.errorCount > 0) {
-            showError(`Failed to download ${result.errorCount} file(s)`);
+            showError(`下载失败：${result.errorCount} 个文件`);
         }
         if (result.error) {
             showError(result.error);
         }
     } catch (error) {
         console.error('Error downloading files:', error);
-        showError('Failed to download files');
+        showError('下载失败');
     } finally {
         downloadBtn.disabled = false;
-        downloadBtn.textContent = 'Download';
+        downloadBtn.textContent = '下载';
     }
 }
 
@@ -407,6 +503,178 @@ document.querySelectorAll('.dropdown-item').forEach(item => {
         closeDropdown();
     });
 });
+
+// Drag & drop events
+if (authFilesContainer) {
+    ensureAuthDropOverlay();
+
+    const onDragEnter = (e) => {
+        if (!isAuthTabActive()) return;
+        e.preventDefault();
+        authDragDepth += 1;
+        showAuthDropOverlay();
+    };
+    const onDragOver = (e) => {
+        if (!isAuthTabActive()) return;
+        e.preventDefault();
+        if (e?.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+        showAuthDropOverlay();
+    };
+    const onDragLeave = (e) => {
+        if (!isAuthTabActive()) return;
+        e.preventDefault();
+        authDragDepth = Math.max(0, authDragDepth - 1);
+        if (authDragDepth === 0) hideAuthDropOverlay();
+    };
+    const onDrop = async (e) => {
+        if (!isAuthTabActive()) return;
+        e.preventDefault();
+        authDragDepth = 0;
+        hideAuthDropOverlay();
+        try {
+            // In WebView2, HTML5 drag/drop dataTransfer can be empty; prefer Tauri native file-drop events.
+            const files = e?.dataTransfer?.files;
+            const count = files ? files.length : 0;
+            if (count > 0) {
+                typeof showSuccessMessage === 'function' && showSuccessMessage(`检测到 ${count} 个文件，正在上传...`);
+                await handleDroppedAuthFiles(files);
+            } else {
+                console.debug('[AUTH-FILES] drop received but no dataTransfer files; waiting for tauri://file-drop');
+            }
+        } catch (error) {
+            console.error('Drop upload failed:', error);
+            showError('上传失败');
+        }
+    };
+
+    // Use container to ensure overlay doesn't swallow events
+    authFilesContainer.addEventListener('dragenter', onDragEnter, true);
+    authFilesContainer.addEventListener('dragover', onDragOver, true);
+    authFilesContainer.addEventListener('dragleave', onDragLeave, true);
+    authFilesContainer.addEventListener('drop', onDrop, true);
+
+    // Prevent browser navigation when dropping files, only while auth tab is active
+    window.addEventListener('dragover', (e) => {
+        if (!isAuthTabActive()) return;
+        e.preventDefault();
+    });
+    window.addEventListener('drop', (e) => {
+        if (!isAuthTabActive()) return;
+        e.preventDefault();
+    });
+}
+
+// Tauri native file-drop (more reliable in WebView2 than HTML5 drag/drop)
+(() => {
+    const tauri = window.__TAURI__;
+    const hasTauri = !!tauri?.core?.invoke;
+    console.log('[AUTH-FILES] init drag-drop', { hasTauri, hasEvent: !!tauri?.event?.listen, hasWindow: !!tauri?.window });
+
+    const extractPaths = (payload) => {
+        if (Array.isArray(payload)) return payload.filter(Boolean);
+        if (Array.isArray(payload?.paths)) return payload.paths.filter(Boolean);
+        if (Array.isArray(payload?.payload)) return payload.payload.filter(Boolean);
+        return [];
+    };
+
+    const register = async () => {
+        if (!tauri) return;
+
+        // Prefer window-scoped listeners; file-drop is emitted per-window in Tauri.
+        let listenTarget = null;
+        try {
+            const candidates = [
+                () => tauri?.window?.getCurrentWindow?.(),
+                () => tauri?.window?.WebviewWindow?.getCurrent?.(),
+                () => tauri?.webviewWindow?.getCurrentWebviewWindow?.(),
+                () => tauri?.webviewWindow?.WebviewWindow?.getCurrent?.(),
+            ];
+            for (const getWindow of candidates) {
+                try {
+                    const w = getWindow();
+                    if (w?.listen) {
+                        listenTarget = w;
+                        break;
+                    }
+                } catch (_) { }
+            }
+        } catch (e) {
+            console.warn('[AUTH-FILES] getCurrentWindow failed:', e);
+        }
+        if (!listenTarget && tauri?.event?.listen) listenTarget = tauri.event;
+        if (!listenTarget?.listen) return;
+
+        // Newer Tauri versions emit drag-drop events.
+        await listenTarget.listen('tauri://drag-enter', (event) => {
+            console.log('[AUTH-FILES] tauri://drag-enter', event?.payload);
+            if (!isAuthTabActive()) return;
+            showAuthDropOverlay();
+        });
+        await listenTarget.listen('tauri://drag-over', (event) => {
+            console.log('[AUTH-FILES] tauri://drag-over', event?.payload);
+            if (!isAuthTabActive()) return;
+            showAuthDropOverlay();
+        });
+        await listenTarget.listen('tauri://drag-leave', (event) => {
+            console.log('[AUTH-FILES] tauri://drag-leave', event?.payload);
+            hideAuthDropOverlay();
+            authDragDepth = 0;
+        });
+        await listenTarget.listen('tauri://drag-drop', async (event) => {
+            console.log('[AUTH-FILES] tauri://drag-drop', event?.payload);
+            if (!isAuthTabActive()) return;
+            hideAuthDropOverlay();
+            authDragDepth = 0;
+
+            const paths = extractPaths(event?.payload);
+            if (!paths.length) return;
+            try {
+                typeof showSuccessMessage === 'function' && showSuccessMessage(`检测到 ${paths.length} 个文件，正在上传...`);
+                await uploadAuthFilesFromTauriPaths(paths);
+                await loadAuthFiles();
+            } catch (e) {
+                console.error('tauri file-drop upload failed:', e);
+                showError(`上传失败：${e?.message || String(e)}`);
+            }
+        });
+
+        // Backward compatibility: older Tauri emitted file-drop events.
+        await listenTarget.listen('tauri://file-drop-hover', (event) => {
+            console.log('[AUTH-FILES] tauri://file-drop-hover', event?.payload);
+            if (!isAuthTabActive()) return;
+            showAuthDropOverlay();
+        });
+        await listenTarget.listen('tauri://file-drop-cancelled', (event) => {
+            console.log('[AUTH-FILES] tauri://file-drop-cancelled', event?.payload);
+            hideAuthDropOverlay();
+            authDragDepth = 0;
+        });
+        await listenTarget.listen('tauri://file-drop', async (event) => {
+            console.log('[AUTH-FILES] tauri://file-drop', event?.payload);
+            if (!isAuthTabActive()) return;
+            hideAuthDropOverlay();
+            authDragDepth = 0;
+            const paths = extractPaths(event?.payload);
+            if (!paths.length) return;
+            try {
+                typeof showSuccessMessage === 'function' && showSuccessMessage(`检测到 ${paths.length} 个文件，正在上传...`);
+                await uploadAuthFilesFromTauriPaths(paths);
+                await loadAuthFiles();
+            } catch (e) {
+                console.error('tauri file-drop upload failed:', e);
+                showError(`上传失败：${e?.message || String(e)}`);
+            }
+        });
+
+        console.log('[AUTH-FILES] registered file-drop listeners', {
+            target: listenTarget === tauri.event ? 'tauri.event' : 'currentWindow'
+        });
+    };
+
+    register().catch((e) => {
+        console.warn('[AUTH-FILES] failed to register tauri file-drop listeners:', e);
+    });
+})();
 
 document.addEventListener('click', (e) => {
     if (!newDropdown.contains(e.target)) {

@@ -24,6 +24,15 @@ tabs.forEach(tab => {
         if (tabId === 'openai') {
             await loadOpenaiProviders();
         }
+        if (tabId === 'quota') {
+            await loadQuotaManagement();
+        }
+        if (tabId === 'config') {
+            await loadConfigManagement();
+        }
+        if (tabId === 'logs') {
+            await loadLogsTab();
+        }
 
         updateActionButtons();
     });

@@ -6,6 +6,29 @@ EasyCLI 是一个基于 Tauri v2 的桌面图形界面，用于在本地或远�
 
 上游项目地址：https://github.com/luispater/CLIProxyAPI
 
+## Doow版更新（基于 https://github.com/router-for-me/EasyCLI）
+本仓库在 https://github.com/router-for-me/EasyCLI 的基础上进行了一系列增强（Doow版），主要包括：
+
+- 口令（Local CPA）行为调整
+  - 启动/重启时不再自动覆盖 `remote-management.secret-key`；启动 CPA 只读取配置中的密钥。
+  - keep-alive 更健壮：连续失败（含 `502 Bad Gateway`）会自动触发重启 CPA（带限频）。
+- CPA 进程与窗口体验
+  - 托盘图标双击打开设置页。
+  - 首次启动窗口直接居中显示（避免先显示在左侧再自动跳到中间）。
+- 配额管理页
+  - 新增统一的配额管理页面，按卡片样式展示，视觉效果对齐 management.html 的风格。
+  - 支持 Gemini / Codex / Antigravity 配额，支持视图切换（模型/管理/JSON），JSON 视图支持一键复制。
+  - Antigravity 模型视图支持“推荐/全部”切换，并覆盖 `imageGenerationModelIds`。
+- CPA 配置页（由“配置管理”更名）
+  - 新增配置编辑器：加载/编辑/搜索/复制/保存（通过 CPA management 接口读写配置）。
+- 日志页
+  - “CLIProxyAPI 输出”：tail 查看、自动刷新、复制、清空。
+  - “错误日志”：文件列表/切换、tail 查看、复制、删除当前文件、删除全部日志文件。
+- 维护快捷操作
+  - 新增按钮：打开 `.../management.html`、更新 CPA（下载/安装流程）、重启 CPA。
+- 认证文件体验
+  - 支持拖拽上传认证 JSON 文件（桌面端使用 Tauri drag-drop 事件）。
+
 ## 功能特性
 - 本地 / 远程双模式，快捷切换。
 - 自动检测、按系统架构下载并解压最新 CLIProxyAPI。

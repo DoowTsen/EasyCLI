@@ -12,6 +12,247 @@ class ConfigManager {
     }
 
     /**
+     * Build management API URL for the given endpoint
+     * @param {string} baseUrl - Base URL without /v0/management
+     * @param {string} endpoint - Endpoint under /v0/management
+     * @returns {string} Full URL
+     */
+    buildManagementApiUrl(baseUrl, endpoint) {
+        const cleanBase = String(baseUrl || '').trim().replace(/\/+$/g, '');
+        const cleanEndpoint = String(endpoint || '').trim().replace(/^\/+/g, '');
+        return `${cleanBase}/v0/management/${cleanEndpoint}`;
+    }
+
+    /**
+     * Fetch with a timeout (AbortController)
+     * @param {string} url
+     * @param {RequestInit} options
+     * @param {number} timeoutMs
+     * @returns {Promise<Response>}
+     */
+    async fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            return await fetch(url, { ...options, signal: controller.signal });
+        } finally {
+            clearTimeout(id);
+        }
+    }
+
+    /**
+     * Make a request to CPA management API, handling Local/Remote auth headers.
+     * @param {{method:string, endpoint:string, body?:any, headers?:Object, timeoutMs?:number}} opts
+     * @returns {Promise<any>} Parsed JSON response
+     */
+    async managementRequest(opts) {
+        const method = (opts?.method || 'GET').toUpperCase();
+        const endpoint = String(opts?.endpoint || '').trim();
+        const timeoutMs = Number.isFinite(opts?.timeoutMs) ? opts.timeoutMs : 30000;
+        const extraHeaders = opts?.headers && typeof opts.headers === 'object' ? opts.headers : {};
+
+        // Always refresh connection info before management requests
+        this.refreshConnection();
+
+        let baseUrl;
+        let authHeaders = {};
+
+        if (this.type === 'local') {
+            const config = await this.getConfig();
+            const port = config.port || 8317;
+            baseUrl = `http://127.0.0.1:${port}`;
+            const key = localStorage.getItem('local-management-key') || '';
+            if (!key) {
+                throw new Error('缺少本地管理密钥，请重启 CLIProxyAPI。');
+            }
+            authHeaders = { 'X-Management-Key': key };
+        } else {
+            baseUrl = this.baseUrl;
+            if (!baseUrl) {
+                throw new Error('缺少远程地址');
+            }
+            if (!this.password) {
+                throw new Error('缺少管理密钥');
+            }
+            authHeaders = { 'Authorization': `Bearer ${this.password}` };
+        }
+
+        const url = this.buildManagementApiUrl(baseUrl, endpoint);
+        const headers = { ...authHeaders, ...extraHeaders };
+
+        const init = {
+            method,
+            headers
+        };
+
+        if (method !== 'GET' && method !== 'HEAD' && opts?.body !== undefined) {
+            init.headers = { 'Content-Type': 'application/json', ...headers };
+            init.body = JSON.stringify(opts.body);
+        }
+
+        const response = await this.fetchWithTimeout(url, init, timeoutMs);
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            const err = data?.error || data?.message || `HTTP ${response.status}: ${response.statusText}`;
+            throw new Error(err);
+        }
+
+        return data;
+    }
+
+    /**
+     * Get authentication status list (used by quota page in management center)
+     * @param {string} state - Optional state token
+     * @returns {Promise<any>}
+     */
+    async getAuthStatus(state = '') {
+        const qs = state ? `get-auth-status?state=${encodeURIComponent(state)}` : 'get-auth-status';
+        return this.managementRequest({ method: 'GET', endpoint: qs });
+    }
+
+    /**
+     * List auth files (used by quota page in management center)
+     * CPA WebUI: GET /v0/management/auth-files -> { files: [...] }
+     * @returns {Promise<any>}
+     */
+    async listAuthFiles() {
+        return this.managementRequest({ method: 'GET', endpoint: 'auth-files' });
+    }
+
+    /**
+     * Fetch raw response from management API (no JSON parsing).
+     * @param {{method?:string, endpoint:string, body?:any, headers?:Object, timeoutMs?:number}} opts
+     * @returns {Promise<Response>}
+     */
+    async managementFetchRaw(opts) {
+        const method = (opts?.method || 'GET').toUpperCase();
+        const endpoint = String(opts?.endpoint || '').trim();
+        const timeoutMs = Number.isFinite(opts?.timeoutMs) ? opts.timeoutMs : 30000;
+        const extraHeaders = opts?.headers && typeof opts.headers === 'object' ? opts.headers : {};
+
+        this.refreshConnection();
+
+        let baseUrl;
+        let authHeaders = {};
+
+        if (this.type === 'local') {
+            const config = await this.getConfig();
+            const port = config.port || 8317;
+            baseUrl = `http://127.0.0.1:${port}`;
+            const key = localStorage.getItem('local-management-key') || '';
+            if (!key) {
+                throw new Error('缺少本地管理密钥，请重启 CLIProxyAPI。');
+            }
+            authHeaders = { 'X-Management-Key': key };
+        } else {
+            baseUrl = this.baseUrl;
+            if (!baseUrl) {
+                throw new Error('缺少远程地址');
+            }
+            if (!this.password) {
+                throw new Error('缺少管理密钥');
+            }
+            authHeaders = { 'Authorization': `Bearer ${this.password}` };
+        }
+
+        const url = this.buildManagementApiUrl(baseUrl, endpoint);
+        const headers = { ...authHeaders, ...extraHeaders };
+        const init = { method, headers };
+
+        if (method !== 'GET' && method !== 'HEAD' && opts?.body !== undefined) {
+            const hasContentType = Object.keys(headers).some(k => k.toLowerCase() === 'content-type');
+            init.headers = hasContentType ? headers : { 'Content-Type': 'application/json', ...headers };
+            init.body = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body);
+        }
+
+        return this.fetchWithTimeout(url, init, timeoutMs);
+    }
+
+    /**
+     * Get raw config.yaml content from CPA management API.
+     * @returns {Promise<string>}
+     */
+    async getConfigYaml() {
+        const response = await this.managementFetchRaw({ method: 'GET', endpoint: 'config.yaml', timeoutMs: 30000 });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        return response.text();
+    }
+
+    /**
+     * Save raw config.yaml content to CPA management API.
+     * @param {string} yamlText
+     * @returns {Promise<any>}
+     */
+    async saveConfigYaml(yamlText) {
+        const response = await this.managementFetchRaw({
+            method: 'PUT',
+            endpoint: 'config.yaml',
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+            body: String(yamlText ?? ''),
+            timeoutMs: 30000
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = data?.error || data?.message || `HTTP ${response.status}: ${response.statusText}`;
+            throw new Error(err);
+        }
+        return data;
+    }
+
+    /**
+     * Download a single auth file as text via CPA management API.
+     * @param {string} filename
+     * @param {{timeoutMs?:number}} options
+     * @returns {Promise<string>}
+     */
+    async downloadAuthFileText(filename, options = {}) {
+        const timeoutMs = Number.isFinite(options?.timeoutMs) ? options.timeoutMs : 30000;
+        const name = String(filename || '').trim();
+        if (!name) throw new Error('文件名为空');
+
+        const endpoint = `auth-files/download?name=${encodeURIComponent(name)}`;
+        const response = await this.managementFetchRaw({ method: 'GET', endpoint, timeoutMs });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        return response.text();
+    }
+
+    /**
+     * Download a single auth file and parse as JSON.
+     * @param {string} filename
+     * @param {{timeoutMs?:number}} options
+     * @returns {Promise<any>}
+     */
+    async downloadAuthFileJson(filename, options = {}) {
+        const text = await this.downloadAuthFileText(filename, options);
+        try {
+            return JSON.parse(text);
+        } catch (e) {
+            throw new Error('认证文件不是有效的 JSON');
+        }
+    }
+
+    /**
+     * Perform a management api-call via CPA backend (used for quota queries)
+     * @param {Object} payload - { authIndex, method, url, header, data }
+     * @param {Object} options - { timeoutMs }
+     * @returns {Promise<any>}
+     */
+    async apiCall(payload, options = {}) {
+        const timeoutMs = Number.isFinite(options?.timeoutMs) ? options.timeoutMs : 30000;
+        return this.managementRequest({
+            method: 'POST',
+            endpoint: 'api-call',
+            body: payload,
+            timeoutMs
+        });
+    }
+
+    /**
      * Save multiple files as a ZIP with a Save As dialog when possible
      * @param {Array<{name:string, content:string|Uint8Array|ArrayBuffer}>} files
      * @param {string} suggestedName
@@ -20,11 +261,11 @@ class ConfigManager {
     async saveFilesAsZip(files, suggestedName = 'auth-files.zip') {
         try {
             if (!Array.isArray(files) || files.length === 0) {
-                return { success: false, error: 'No files to save' };
+                return { success: false, error: '没有可保存的文件' };
             }
             if (typeof window.__zipFiles !== 'function') {
                 // Missing ZIP util
-                return { success: false, error: 'ZIP utility not loaded' };
+                return { success: false, error: 'ZIP 工具未加载' };
             }
             const blob = window.__zipFiles(files);
             if (typeof window.showSaveFilePicker === 'function') {
@@ -38,7 +279,7 @@ class ConfigManager {
                     await writable.close();
                 } catch (e) {
                     if (e && e.name === 'AbortError') {
-                        return { success: false, error: 'User cancelled save dialog' };
+                        return { success: false, error: '用户取消了保存' };
                     }
                     // Fallback to anchor download
                     const url = URL.createObjectURL(blob);
@@ -211,7 +452,7 @@ class ConfigManager {
      */
     async importVertexCredential(file, location = 'us-central1') {
         if (!file) {
-            return { success: false, error: 'No file selected' };
+            return { success: false, error: '未选择文件' };
         }
         if (this.type === 'local') {
             return this.importLocalVertexCredential(file, location);
@@ -871,7 +1112,7 @@ class ConfigManager {
                 const data = await response.json();
                 return data.files || [];
             } else {
-                throw new Error(`Failed to load auth files: ${response.status}`);
+                throw new Error(`加载认证文件失败：${response.status}`);
             }
         } catch (error) {
             console.error('Error getting remote auth files:', error);
@@ -1131,7 +1372,7 @@ class ConfigManager {
                 }
                 return { success: false, error: res.error || 'Failed to save ZIP', errorCount };
             }
-            return { success: false, error: 'No file downloaded', errorCount };
+            return { success: false, error: '没有成功下载任何文件', errorCount };
         } catch (error) {
             if (error && error.name === 'AbortError') {
                 return {
