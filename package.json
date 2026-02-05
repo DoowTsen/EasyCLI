@@ -1,6 +1,6 @@
 {
   "name": "easycli",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "EasyCLI - A Tauri-based desktop GUI for CLIProxyAPI",
   "scripts": {
     "dev": "tauri dev",

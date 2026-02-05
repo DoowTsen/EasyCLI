@@ -2296,7 +2296,10 @@ fn run_keep_alive_loop(stop: Arc<AtomicBool>, app: tauri::AppHandle, port: u16, 
     };
 
     let mut consecutive_failures: u32 = 0;
-    let mut last_restart = std::time::Instant::now() - Duration::from_secs(3600);
+    let now = std::time::Instant::now();
+    let mut last_restart = now
+        .checked_sub(Duration::from_secs(3600))
+        .unwrap_or(now);
 
     while !stop.load(Ordering::SeqCst) {
         // Send keep-alive request

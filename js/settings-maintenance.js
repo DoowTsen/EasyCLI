@@ -65,7 +65,7 @@ async function updateCpa() {
         }
         showConfirmDialog('更新 CLIProxyAPI', msg, async () => {
             await doUpdate(proxyUrl);
-        });
+        }, { confirmText: '更新', confirmButtonClass: 'btn-primary' });
     } catch (e) {
         console.error('updateCpa failed:', e);
         typeof showError === 'function' && showError(`更新失败：${e?.message || String(e)}`);
@@ -125,7 +125,7 @@ restartCpaBtn && restartCpaBtn.addEventListener('click', async () => {
     };
 
     if (typeof showConfirmDialog === 'function') {
-        showConfirmDialog('重启 CLIProxyAPI', '确定要重启 CPA 吗？', doRestart);
+        showConfirmDialog('重启 CLIProxyAPI', '确定要重启 CPA 吗？', doRestart, { confirmText: '确定', confirmButtonClass: 'btn-primary' });
     } else {
         if (confirm('确定要重启 CPA 吗？')) await doRestart();
     }
