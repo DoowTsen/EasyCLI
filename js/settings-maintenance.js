@@ -78,20 +78,29 @@ async function updateCpa() {
 async function doUpdate(proxyUrl) {
     updateCpaBtn && (updateCpaBtn.disabled = true);
     if (updateCpaBtn) updateCpaBtn.textContent = '更新中...';
-    const res = await window.__TAURI__.core.invoke('download_cliproxyapi', { proxyUrl });
-    if (!res || !res.success) {
-        throw new Error(res?.error || '下载/安装失败');
-    }
-    localStorage.setItem('cliproxyapi-path', res.path || '');
-    localStorage.setItem('cliproxyapi-version', res.version || '');
-    typeof showSuccessMessage === 'function' && showSuccessMessage(`更新完成：${res.version || ''}`);
-
-    // Restart local CPA if possible
     try {
-        await window.__TAURI__.core.invoke('restart_cliproxyapi');
-        typeof showSuccessMessage === 'function' && showSuccessMessage('已重启 CLIProxyAPI');
+        const res = await window.__TAURI__.core.invoke('download_cliproxyapi', { proxyUrl });
+        if (!res || !res.success) {
+            throw new Error(res?.error || '下载/安装失败');
+        }
+
+        localStorage.setItem('cliproxyapi-path', res.path || '');
+        localStorage.setItem('cliproxyapi-version', res.version || '');
+        typeof showSuccessMessage === 'function' && showSuccessMessage(`更新完成：${res.version || ''}`);
+
+        // Restart local CPA if possible
+        try {
+            await window.__TAURI__.core.invoke('restart_cliproxyapi');
+            typeof showSuccessMessage === 'function' && showSuccessMessage('已重启 CLIProxyAPI');
+        } catch (e) {
+            console.warn('restart_cliproxyapi failed:', e);
+        }
     } catch (e) {
-        console.warn('restart_cliproxyapi failed:', e);
+        console.error('doUpdate failed:', e);
+        typeof showError === 'function' && showError(`更新失败：${e?.message || String(e)}`);
+    } finally {
+        updateCpaBtn && (updateCpaBtn.disabled = false);
+        if (updateCpaBtn) updateCpaBtn.textContent = '更新 CPA';
     }
 }
 
