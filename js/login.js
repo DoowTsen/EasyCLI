@@ -44,11 +44,17 @@ const updateDialog = document.getElementById('update-dialog');
 const updateDialogMessage = document.getElementById('update-dialog-message');
 const updateCancelBtn = document.getElementById('update-cancel-btn');
 const updateConfirmBtn = document.getElementById('update-confirm-btn');
+const helperUpdateDialog = document.getElementById('helper-update-dialog');
+const helperUpdateDialogMessage = document.getElementById('helper-update-dialog-message');
+const helperUpdateCancelBtn = document.getElementById('helper-update-cancel-btn');
+const helperUpdateConfirmBtn = document.getElementById('helper-update-confirm-btn');
 const passwordDialog = document.getElementById('password-dialog');
 const passwordInput1 = document.getElementById('password-input-1');
 const passwordInput2 = document.getElementById('password-input-2');
 const passwordCancelBtn = document.getElementById('password-cancel-btn');
 const passwordSaveBtn = document.getElementById('password-save-btn');
+let isConnecting = false;
+let helperUpdateResolver = null;
 
 // Initialize the display state
 initializeFromLocalStorage();
@@ -95,28 +101,162 @@ async function openSettingsWindowPreferNew() {
     // Fallback only if Tauri unavailable
     window.location.href = 'settings.html';
 }
+
+function saveLocalManagementKey(startRes) {
+    if (startRes?.password) {
+        localStorage.setItem('local-management-key', startRes.password);
+        console.log('Saved local management key:', startRes.password);
+    }
+}
+
+function startLocalKeepAlive() {
+    if (window.configManager) {
+        window.configManager.startKeepAlive().catch(error => {
+            console.error('Error starting keep-alive:', error);
+        });
+    }
+}
+
+async function startLocalCpa() {
+    const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
+    if (!startRes || !startRes.success) {
+        showError('CLIProxyAPI 启动失败');
+        return false;
+    }
+    saveLocalManagementKey(startRes);
+    startLocalKeepAlive();
+    return true;
+}
+
+async function startLocalHelper() {
+    try {
+        const helperRes = await window.__TAURI__.core.invoke('start_cpa_helper');
+        if (!helperRes || !helperRes.success) {
+            console.warn('CPA-Helper start skipped:', helperRes?.error || helperRes);
+            return false;
+        }
+        return true;
+    } catch (error) {
+        console.warn('CPA-Helper start failed:', error);
+        return false;
+    }
+}
+
+async function restartLocalHelper() {
+    try {
+        const helperRes = await window.__TAURI__.core.invoke('restart_cpa_helper');
+        if (!helperRes || !helperRes.success) {
+            console.warn('CPA-Helper restart skipped:', helperRes?.error || helperRes);
+            return false;
+        }
+        return true;
+    } catch (error) {
+        console.warn('CPA-Helper restart failed:', error);
+        return false;
+    }
+}
+
+function askHelperUpdate(checkResult) {
+    if (!helperUpdateDialog || !helperUpdateDialogMessage) {
+        return Promise.resolve(false);
+    }
+
+    const currentVersion = checkResult?.version || '未安装';
+    const latestVersion = checkResult?.latestVersion || '未知';
+    helperUpdateDialogMessage.textContent =
+        `当前版本：${currentVersion}\n最新版本：${latestVersion}\n\n是否更新 CPA-Helper 到最新版本？`;
+    helperUpdateDialog.classList.add('show');
+
+    return new Promise(resolve => {
+        helperUpdateResolver = resolve;
+    });
+}
+
+async function checkUpdateAndStartHelper(proxyUrl) {
+    if (!window.__TAURI__?.core?.invoke) return;
+    try {
+        let helperUpdated = false;
+
+        progressContainer.classList.add('show');
+        progressLabel.textContent = '正在检查 CPA-Helper 版本...';
+        progressFill.style.width = '0%';
+        progressText.textContent = '0%';
+
+        const check = await window.__TAURI__.core.invoke('check_helper_version_and_download', { proxyUrl });
+        if (!check || !check.success) {
+            throw new Error(check?.error || '检查 CPA-Helper 版本失败');
+        }
+
+        if (check.needsUpdate) {
+            progressContainer.classList.remove('show');
+            const shouldUpdate = await askHelperUpdate(check);
+            if (!shouldUpdate) {
+                if (check.path) localStorage.setItem('cpa-helper-path', check.path);
+                if (check.version) {
+                    localStorage.setItem('cpa-helper-version', check.version);
+                    await startLocalHelper();
+                }
+                return false;
+            }
+
+            progressLabel.textContent = '正在下载 CPA-Helper...';
+            const result = await window.__TAURI__.core.invoke('download_cpa_helper', { proxyUrl });
+            if (!result || !result.success) {
+                throw new Error(result?.error || '下载 CPA-Helper 失败');
+            }
+            localStorage.setItem('cpa-helper-path', result.path || '');
+            localStorage.setItem('cpa-helper-version', result.version || '');
+            helperUpdated = true;
+            showSuccess(`CPA-Helper ${result.version || ''} 更新完成`);
+        } else {
+            if (check.path) localStorage.setItem('cpa-helper-path', check.path);
+            if (check.version) localStorage.setItem('cpa-helper-version', check.version);
+            console.log('CPA-Helper version is latest:', check.version);
+        }
+
+        if (helperUpdated) {
+            await restartLocalHelper();
+        } else {
+            await startLocalHelper();
+        }
+        return true;
+    } catch (error) {
+        console.warn('CPA-Helper check/update/start failed:', error);
+        showError('CPA-Helper 检查或启动失败：' + (error?.message || String(error)));
+        return false;
+    } finally {
+        setTimeout(() => {
+            progressContainer.classList.remove('show');
+        }, 1000);
+    }
+}
+
+function resolveHelperUpdateDialog(shouldUpdate) {
+    if (helperUpdateDialog) {
+        helperUpdateDialog.classList.remove('show');
+    }
+    if (helperUpdateResolver) {
+        helperUpdateResolver(shouldUpdate);
+        helperUpdateResolver = null;
+    }
+}
+
+if (helperUpdateCancelBtn) {
+    helperUpdateCancelBtn.addEventListener('click', () => resolveHelperUpdateDialog(false));
+}
+
+if (helperUpdateConfirmBtn) {
+    helperUpdateConfirmBtn.addEventListener('click', () => resolveHelperUpdateDialog(true));
+}
+
 updateCancelBtn.addEventListener('click', async () => {
     updateDialog.classList.remove('show');
     // User chose not to update, still run local
     localStorage.setItem('type', "local");
     if (window.__TAURI__?.core?.invoke) {
         try {
-            const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
-            if (!startRes || !startRes.success) {
-                showError('CLIProxyAPI 启动失败');
-                return;
-            }
-            // Save the generated password for local mode HTTP requests
-            if (startRes.password) {
-                localStorage.setItem('local-management-key', startRes.password);
-                console.log('Saved local management key:', startRes.password);
-            }
-            // Start keep-alive mechanism for Local mode
-            if (window.configManager) {
-                window.configManager.startKeepAlive().catch(error => {
-                    console.error('Error starting keep-alive:', error);
-                });
-            }
+            const started = await startLocalCpa();
+            if (!started) return;
         } catch (e) {
             showError('CLIProxyAPI process start error');
             return;
@@ -155,22 +295,8 @@ updateConfirmBtn.addEventListener('click', async () => {
                 } else {
                     // Password is set: start process then go to settings
                     try {
-                        const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
-                        if (!startRes || !startRes.success) {
-                            showError('CLIProxyAPI 启动失败');
-                            return;
-                        }
-                        // Save the generated password for local mode HTTP requests
-                        if (startRes.password) {
-                            localStorage.setItem('local-management-key', startRes.password);
-                            console.log('Saved local management key:', startRes.password);
-                        }
-                        // Start keep-alive mechanism for Local mode
-                        if (window.configManager) {
-                            window.configManager.startKeepAlive().catch(error => {
-                                console.error('Error starting keep-alive:', error);
-                            });
-                        }
+                        const started = await startLocalCpa();
+                        if (!started) return;
                     } catch (e) {
                         showError('CLIProxyAPI process start error');
                         return;
@@ -247,16 +373,8 @@ passwordSaveBtn.addEventListener('click', async () => {
 
                 // Start process then go to settings
                 try {
-                    const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
-                    if (!startRes || !startRes.success) {
-                        showError('CLIProxyAPI 启动失败');
-                        return;
-                    }
-                    // Save the generated password for local mode HTTP requests
-                    if (startRes.password) {
-                        localStorage.setItem('local-management-key', startRes.password);
-                        console.log('Saved local management key:', startRes.password);
-                    }
+                    const started = await startLocalCpa();
+                    if (!started) return;
                 } catch (e) {
                     showError('CLIProxyAPI process start error');
                     return;
@@ -289,6 +407,8 @@ passwordSaveBtn.addEventListener('click', async () => {
 if (window.__TAURI__?.event?.listen) {
     window.__TAURI__.event.listen('download-progress', (event) => { updateProgress(event?.payload || {}); });
     window.__TAURI__.event.listen('download-status', (event) => { handleDownloadStatus(event?.payload || {}); });
+    window.__TAURI__.event.listen('helper-download-progress', (event) => { updateProgress(event?.payload || {}); });
+    window.__TAURI__.event.listen('helper-download-status', (event) => { handleHelperDownloadStatus(event?.payload || {}); });
     window.__TAURI__.event.listen('process-start-error', (event) => {
         const errorData = event?.payload || {};
         console.error('CLIProxyAPI process start failed:', errorData);
@@ -333,6 +453,11 @@ function initializeFromLocalStorage() {
 }
 
 async function handleConnectClick() {
+    if (isConnecting) {
+        return;
+    }
+    isConnecting = true;
+
     try { showSuccess('连接中...'); } catch (_) { }
     const localSelected = localCard.classList.contains('selected');
 
@@ -346,6 +471,7 @@ async function handleConnectClick() {
             const validation = validateProxyUrl(proxyUrl);
             if (!validation.valid) {
                 showError(validation.error);
+                isConnecting = false;
                 return;
             }
         }
@@ -369,16 +495,18 @@ async function handleConnectClick() {
                 if (result.success) {
                     if (result.needsUpdate) {
                         // Update needed, show update dialog
-                        updateDialogMessage.textContent =
-                            `当前版本：${result.version}\n最新版本：${result.latestVersion}\n\n是否更新到最新版本？`;
-                        updateDialog.classList.add('show');
-
                         // Save current path information
                         localStorage.setItem('type', "local");
                         localStorage.setItem('cliproxyapi-path', result.path);
                         localStorage.setItem('cliproxyapi-version', result.version);
                         localStorage.removeItem('base-url');
                         localStorage.removeItem('password');
+
+                        await checkUpdateAndStartHelper(proxyUrl);
+
+                        updateDialogMessage.textContent =
+                            `当前版本：${result.version}\n最新版本：${result.latestVersion}\n\n是否更新到最新版本？`;
+                        updateDialog.classList.add('show');
                     } else {
                         // Version is latest, check password
                         console.log('CLIProxyAPI version is latest:', result.version);
@@ -390,6 +518,8 @@ async function handleConnectClick() {
                         localStorage.removeItem('base-url');
                         localStorage.removeItem('password');
 
+                        await checkUpdateAndStartHelper(proxyUrl);
+
                         // Check if password needs to be set
                         const secretKeyResult = await window.__TAURI__.core.invoke('check_secret_key');
                         if (secretKeyResult.needsPassword) {
@@ -398,16 +528,8 @@ async function handleConnectClick() {
                         } else {
                             // Password is set: start process then open settings page
                             try {
-                                const startRes = await window.__TAURI__.core.invoke('start_cliproxyapi');
-                                if (!startRes || !startRes.success) {
-                                    showError('CLIProxyAPI 启动失败');
-                                    return;
-                                }
-                                // Save the generated password for local mode HTTP requests
-                                if (startRes.password) {
-                                    localStorage.setItem('local-management-key', startRes.password);
-                                    console.log('Saved local management key:', startRes.password);
-                                }
+                                const started = await startLocalCpa();
+                                if (!started) return;
                             } catch (e) {
                                 showError('CLIProxyAPI process start error');
                                 return;
@@ -425,10 +547,14 @@ async function handleConnectClick() {
         } catch (error) {
             console.error('Error checking version:', error);
             showError('检查版本出错：' + error.message);
+            const started = await startLocalCpa();
+            if (!started) return;
+            await openSettingsWindowPreferNew();
         } finally {
             // Re-enable button
             continueBtn.disabled = false;
             continueBtn.textContent = '连接';
+            isConnecting = false;
         }
         return;
     }
@@ -439,11 +565,13 @@ async function handleConnectClick() {
 
     if (!remoteUrl) {
         showError('请输入远程地址');
+        isConnecting = false;
         return;
     }
 
     if (!password) {
         showError('请输入管理密钥');
+        isConnecting = false;
         return;
     }
 
@@ -495,6 +623,7 @@ async function handleConnectClick() {
         // Re-enable button
         continueBtn.disabled = false;
         continueBtn.textContent = '连接';
+        isConnecting = false;
     }
 }
 
@@ -502,16 +631,7 @@ async function handleConnectClick() {
 if (continueBtn) {
     continueBtn.addEventListener('click', handleConnectClick);
 }
-// Provide a global fallback for inline onclick
 window.__onConnect = handleConnectClick;
-
-// Event delegation fallback in case of dynamic DOM
-document.addEventListener('click', (e) => {
-    const t = e.target;
-    if (t && t.id === 'continue-btn') {
-        handleConnectClick();
-    }
-});
 
 // Toast queue management
 let toastQueue = [];
@@ -613,6 +733,39 @@ function handleDownloadStatus(statusData) {
         case 'failed':
             progressContainer.classList.remove('show');
             showError('操作失败：' + statusData.error);
+            break;
+    }
+}
+
+function handleHelperDownloadStatus(statusData) {
+    switch (statusData.status) {
+        case 'checking':
+            progressContainer.classList.add('show');
+            progressLabel.textContent = '正在检查 CPA-Helper 版本...';
+            progressFill.style.width = '0%';
+            progressText.textContent = '0%';
+            break;
+
+        case 'starting':
+            progressContainer.classList.add('show');
+            progressLabel.textContent = '正在下载 CPA-Helper...';
+            progressFill.style.width = '0%';
+            progressText.textContent = '0%';
+            break;
+
+        case 'completed':
+            progressLabel.textContent = 'CPA-Helper 下载完成！';
+            progressFill.style.width = '100%';
+            progressText.textContent = '100%';
+            break;
+
+        case 'latest':
+        case 'update-available':
+            break;
+
+        case 'failed':
+            progressContainer.classList.remove('show');
+            showError('CPA-Helper 下载失败');
             break;
     }
 }

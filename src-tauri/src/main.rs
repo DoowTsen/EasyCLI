@@ -47,7 +47,16 @@ static CLI_PROXY_PASSWORD: Lazy<Arc<Mutex<Option<String>>>> =
 // In-memory capture of CPA stdout/stderr (tail only) for UI display
 static CPA_OUTPUT_TAIL: Lazy<Arc<Mutex<VecDeque<String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(VecDeque::new())));
+static HELPER_PROCESS_PID: Lazy<Arc<Mutex<Option<u32>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 const CPA_OUTPUT_MAX_LINES: usize = 3000;
+const RELEASE_CPA_DIR_NAME: &str = "cliproxyapi";
+const DEBUG_CPA_DIR_NAME: &str = "cliproxyapi-debug";
+const DEBUG_CPA_PORT: u16 = 8318;
+const HELPER_REPO_API: &str = "https://api.github.com/repos/walkingddd/CPA-Helper/releases/latest";
+const HELPER_DIR_PREFIX: &str = "helper-";
+const HELPER_VERSION_FILE: &str = "helper-version.txt";
+const HELPER_DATA_DIR_NAME: &str = "helper-data";
+const HELPER_PORT: u16 = 18317;
 
 fn extract_secret_key(conf: &serde_yaml::Value) -> Option<String> {
     conf.get("remote-management")
@@ -76,8 +85,24 @@ fn home_dir() -> Result<PathBuf, AppError> {
     home::home_dir().ok_or_else(|| AppError::Other("Failed to resolve home directory".into()))
 }
 
+fn is_debug_cpa_mode() -> bool {
+    cfg!(debug_assertions)
+}
+
+fn cpa_dir_name_for_debug(debug: bool) -> &'static str {
+    if debug {
+        DEBUG_CPA_DIR_NAME
+    } else {
+        RELEASE_CPA_DIR_NAME
+    }
+}
+
 fn app_dir() -> Result<PathBuf, AppError> {
-    Ok(home_dir()?.join("cliproxyapi"))
+    Ok(home_dir()?.join(cpa_dir_name_for_debug(is_debug_cpa_mode())))
+}
+
+fn release_app_dir() -> Result<PathBuf, AppError> {
+    Ok(home_dir()?.join(RELEASE_CPA_DIR_NAME))
 }
 
 fn resolve_path(input: &str, base: Option<&Path>) -> PathBuf {
@@ -151,6 +176,75 @@ fn compare_versions(a: &str, b: &str) -> i32 {
     0
 }
 
+fn normalize_release_version(tag: &str) -> String {
+    tag.trim().trim_start_matches('v').to_string()
+}
+
+fn helper_dir_name(version: &str) -> String {
+    format!(
+        "{}{}",
+        HELPER_DIR_PREFIX,
+        normalize_release_version(version)
+    )
+}
+
+fn helper_data_dir_from_app_dir(dir: &Path) -> PathBuf {
+    dir.join(HELPER_DATA_DIR_NAME)
+}
+
+fn helper_asset_arch(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("amd64"),
+        "aarch64" => Some("aarch64"),
+        _ => None,
+    }
+}
+
+fn helper_asset_filename_for(tag: &str, platform: &str, arch: &str) -> Result<String, String> {
+    if platform != "windows" {
+        return Err(format!("Unsupported CPA-Helper platform: {}", platform));
+    }
+    let asset_arch =
+        helper_asset_arch(arch).ok_or_else(|| format!("Unsupported CPA-Helper arch: {}", arch))?;
+    Ok(format!(
+        "cpa-helper_{}_windows_{}.zip",
+        tag.trim(),
+        asset_arch
+    ))
+}
+
+fn select_helper_asset(release: &VersionInfo, platform: &str, arch: &str) -> Result<Asset, String> {
+    let filename = helper_asset_filename_for(&release.tag_name, platform, arch)?;
+    if let Some(asset) = release.assets.iter().find(|a| a.name == filename) {
+        return Ok(asset.clone());
+    }
+
+    let asset_arch =
+        helper_asset_arch(arch).ok_or_else(|| format!("Unsupported CPA-Helper arch: {}", arch))?;
+    release
+        .assets
+        .iter()
+        .find(|a| {
+            let name = a.name.to_lowercase();
+            name.contains("windows") && name.contains(asset_arch) && name.ends_with(".zip")
+        })
+        .cloned()
+        .ok_or_else(|| format!("No suitable CPA-Helper download file found: {}", filename))
+}
+
+fn is_old_helper_dir_name(name: &str, latest_version: &str) -> bool {
+    if name == HELPER_DATA_DIR_NAME || !name.starts_with(HELPER_DIR_PREFIX) {
+        return false;
+    }
+    let suffix = &name[HELPER_DIR_PREFIX.len()..];
+    suffix
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit() || c == 'v')
+        .unwrap_or(false)
+        && name != helper_dir_name(latest_version)
+}
+
 fn current_local_info() -> Result<Option<(String, PathBuf)>, AppError> {
     let dir = app_dir()?;
     let version_file = dir.join("version.txt");
@@ -165,16 +259,211 @@ fn current_local_info() -> Result<Option<(String, PathBuf)>, AppError> {
     Ok(Some((ver, path)))
 }
 
-fn ensure_config(version_path: &Path) -> Result<(), AppError> {
+fn current_helper_info() -> Result<Option<(String, PathBuf)>, AppError> {
     let dir = app_dir()?;
-    let config = dir.join("config.yaml");
-    if config.exists() {
+    let version_file = dir.join(HELPER_VERSION_FILE);
+    if !version_file.exists() {
+        return Ok(None);
+    }
+    let ver = normalize_release_version(fs::read_to_string(&version_file)?.trim());
+    let path = dir.join(helper_dir_name(&ver));
+    if !path.exists() {
+        return Ok(None);
+    }
+    if find_helper_executable(&path).is_none() {
+        return Ok(None);
+    }
+    Ok(Some((ver, path)))
+}
+
+fn split_line_ending(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+fn split_yaml_value_comment(value: &str) -> (&str, &str) {
+    for (idx, ch) in value.char_indices() {
+        if ch == '#' {
+            let is_comment = idx == 0
+                || value[..idx]
+                    .chars()
+                    .last()
+                    .map(|c| c.is_whitespace())
+                    .unwrap_or(false);
+            if is_comment {
+                return value.split_at(idx);
+            }
+        }
+    }
+    (value, "")
+}
+
+fn replace_root_port_line(line: &str, port: u16) -> Option<String> {
+    let mut key_start = 0usize;
+    if line.starts_with('\u{feff}') {
+        key_start = '\u{feff}'.len_utf8();
+    }
+
+    let bytes = line.as_bytes();
+    if bytes
+        .get(key_start)
+        .map(|b| b.is_ascii_whitespace())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let after_key_start = key_start + "port".len();
+    if !line.get(key_start..)?.starts_with("port") {
+        return None;
+    }
+
+    let mut colon_idx = after_key_start;
+    while let Some(b) = bytes.get(colon_idx) {
+        if *b == b' ' || *b == b'\t' {
+            colon_idx += 1;
+            continue;
+        }
+        break;
+    }
+
+    if bytes.get(colon_idx) != Some(&b':') {
+        return None;
+    }
+
+    let value_start = colon_idx + 1;
+    let value = line.get(value_start..)?;
+    let leading_len = value
+        .char_indices()
+        .find(|(_, c)| *c != ' ' && *c != '\t')
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len());
+    let leading = &value[..leading_len];
+    let after_leading = &value[leading_len..];
+    let (before_comment, comment) = split_yaml_value_comment(after_leading);
+    let trimmed_len = before_comment.trim_end().len();
+    let comment_gap = &before_comment[trimmed_len..];
+    let leading = if leading.is_empty() { " " } else { leading };
+    let comment_gap = if !comment.is_empty() && comment_gap.is_empty() {
+        " "
+    } else {
+        comment_gap
+    };
+
+    Some(format!(
+        "{}{}{}{}{}",
+        &line[..value_start],
+        leading,
+        port,
+        comment_gap,
+        comment
+    ))
+}
+
+fn set_root_yaml_port_text(content: &str, port: u16) -> Option<String> {
+    let mut replaced = false;
+    let mut out = String::with_capacity(content.len());
+
+    for line in content.split_inclusive('\n') {
+        let (body, ending) = split_line_ending(line);
+        if !replaced {
+            if let Some(new_body) = replace_root_port_line(body, port) {
+                out.push_str(&new_body);
+                out.push_str(ending);
+                replaced = true;
+                continue;
+            }
+        }
+        out.push_str(body);
+        out.push_str(ending);
+    }
+
+    if replaced {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn set_root_yaml_port(content: &str, port: u16) -> Result<String, AppError> {
+    if let Some(out) = set_root_yaml_port_text(content, port) {
+        return Ok(out);
+    }
+
+    let mut value: serde_yaml::Value = if content.trim().is_empty() {
+        serde_yaml::Value::Mapping(Default::default())
+    } else {
+        serde_yaml::from_str(content)?
+    };
+
+    if !value.is_mapping() {
+        value = serde_yaml::Value::Mapping(Default::default());
+    }
+
+    let mapping = value
+        .as_mapping_mut()
+        .ok_or_else(|| AppError::Other("Failed to create config mapping".into()))?;
+    mapping.insert(
+        serde_yaml::Value::from("port"),
+        serde_yaml::Value::from(port as u64),
+    );
+
+    Ok(serde_yaml::to_string(&value)?)
+}
+
+fn ensure_config_port(config: &Path, port: u16) -> Result<(), AppError> {
+    if !config.exists() {
         return Ok(());
     }
-    let example = version_path.join("config.example.yaml");
-    if example.exists() {
-        fs::copy(example, &config)?;
+
+    let content = fs::read_to_string(config)?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    let current_port = value.get("port").and_then(|v| v.as_u64());
+
+    if current_port != Some(port as u64) {
+        fs::write(config, set_root_yaml_port(&content, port)?)?;
     }
+
+    Ok(())
+}
+
+fn ensure_config(version_path: &Path) -> Result<(), AppError> {
+    let dir = app_dir()?;
+    fs::create_dir_all(&dir)?;
+    let config = dir.join("config.yaml");
+    if config.exists() {
+        if is_debug_cpa_mode() {
+            ensure_config_port(&config, DEBUG_CPA_PORT)?;
+        }
+        return Ok(());
+    }
+
+    if is_debug_cpa_mode() {
+        let release_config = release_app_dir()?.join("config.yaml");
+        if release_config.exists() {
+            let content = fs::read_to_string(&release_config)?;
+            fs::write(&config, set_root_yaml_port(&content, DEBUG_CPA_PORT)?)?;
+        } else {
+            let example = version_path.join("config.example.yaml");
+            if example.exists() {
+                let content = fs::read_to_string(&example)?;
+                fs::write(&config, set_root_yaml_port(&content, DEBUG_CPA_PORT)?)?;
+            }
+        }
+
+        ensure_config_port(&config, DEBUG_CPA_PORT)?;
+    } else {
+        let example = version_path.join("config.example.yaml");
+        if example.exists() {
+            fs::copy(example, &config)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -306,6 +595,122 @@ mod tests {
         assert!(parse_proxy_url("http://proxy").is_err());
         assert!(parse_proxy_url("http://user@proxy:8080").is_err());
     }
+
+    #[test]
+    fn set_root_yaml_port_replaces_existing_root_port() {
+        let input = "host: 127.0.0.1\nport: 8317\ntls: false\n";
+
+        let out = set_root_yaml_port(input, DEBUG_CPA_PORT).unwrap();
+
+        assert!(out.contains("port: 8318\n"));
+        assert!(!out.contains("port: 8317\n"));
+    }
+
+    #[test]
+    fn set_root_yaml_port_preserves_spacing_and_inline_comment() {
+        let input = "host: 127.0.0.1\nport:    8317    # local CPA port\n";
+
+        let out = set_root_yaml_port(input, DEBUG_CPA_PORT).unwrap();
+
+        assert!(out.contains("port:    8318    # local CPA port\n"));
+    }
+
+    #[test]
+    fn set_root_yaml_port_keeps_nested_port_unchanged() {
+        let input = "host: 127.0.0.1\nport: 8317\nservice:\n  port: 9000\n";
+
+        let out = set_root_yaml_port(input, DEBUG_CPA_PORT).unwrap();
+
+        assert!(out.contains("port: 8318\n"));
+        assert!(out.contains("  port: 9000\n"));
+    }
+
+    #[test]
+    fn set_root_yaml_port_adds_missing_root_port() {
+        let input = "host: 127.0.0.1\ntls: false\n";
+
+        let out = set_root_yaml_port(input, DEBUG_CPA_PORT).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+
+        assert_eq!(value.get("port").and_then(|v| v.as_u64()), Some(8318));
+    }
+
+    #[test]
+    fn release_build_uses_release_cpa_directory_name() {
+        assert_eq!(cpa_dir_name_for_debug(false), RELEASE_CPA_DIR_NAME);
+    }
+
+    #[test]
+    fn debug_build_uses_debug_cpa_directory_name() {
+        assert_eq!(cpa_dir_name_for_debug(true), DEBUG_CPA_DIR_NAME);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn current_debug_build_selects_debug_cpa_directory_name() {
+        assert_eq!(
+            cpa_dir_name_for_debug(is_debug_cpa_mode()),
+            DEBUG_CPA_DIR_NAME
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn current_release_build_selects_release_cpa_directory_name() {
+        assert_eq!(
+            cpa_dir_name_for_debug(is_debug_cpa_mode()),
+            RELEASE_CPA_DIR_NAME
+        );
+    }
+
+    #[test]
+    fn helper_release_asset_filename_uses_tag_and_windows_amd64() {
+        let filename = helper_asset_filename_for("v0.3.0", "windows", "x86_64").unwrap();
+
+        assert_eq!(filename, "cpa-helper_v0.3.0_windows_amd64.zip");
+    }
+
+    #[test]
+    fn helper_release_version_is_stored_without_v_prefix() {
+        assert_eq!(normalize_release_version("v0.3.0"), "0.3.0");
+    }
+
+    #[test]
+    fn helper_version_compare_detects_update_needed() {
+        assert!(compare_versions("0.2.26", &normalize_release_version("v0.3.0")) < 0);
+    }
+
+    #[test]
+    fn helper_version_compare_detects_latest() {
+        assert_eq!(
+            compare_versions("0.3.0", &normalize_release_version("v0.3.0")),
+            0
+        );
+    }
+
+    #[test]
+    fn helper_cleanup_matches_only_old_helper_dirs() {
+        assert!(is_old_helper_dir_name("helper-0.2.26", "0.3.0"));
+        assert!(!is_old_helper_dir_name("helper-0.3.0", "0.3.0"));
+        assert!(!is_old_helper_dir_name("1.2.3", "0.3.0"));
+        assert!(!is_old_helper_dir_name("helper-data", "0.3.0"));
+    }
+
+    #[test]
+    fn helper_data_dir_is_under_app_dir() {
+        let app = PathBuf::from(r"C:\Users\Lenovo\cliproxyapi-debug");
+
+        assert_eq!(
+            helper_data_dir_from_app_dir(&app),
+            PathBuf::from(r"C:\Users\Lenovo\cliproxyapi-debug").join("helper-data")
+        );
+    }
+
+    #[test]
+    fn helper_uses_same_root_directory_selector_as_cpa() {
+        assert_eq!(cpa_dir_name_for_debug(true), DEBUG_CPA_DIR_NAME);
+        assert_eq!(cpa_dir_name_for_debug(false), RELEASE_CPA_DIR_NAME);
+    }
 }
 
 fn parse_proxy_url(proxy_url: &str) -> Result<ProxyConfig, String> {
@@ -370,17 +775,29 @@ fn parse_proxy_url(proxy_url: &str) -> Result<ProxyConfig, String> {
     }
 }
 
-async fn fetch_latest_release(proxy_url: String) -> Result<VersionInfo, AppError> {
+async fn fetch_release_from_api(api_url: &str, proxy_url: String) -> Result<VersionInfo, AppError> {
     let client = parse_proxy(&proxy_url, reqwest::Client::builder())
         .user_agent("EasyCLI")
         .build()?;
     let resp = client
-        .get("https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest")
+        .get(api_url)
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await?
         .error_for_status()?;
     Ok(resp.json::<VersionInfo>().await?)
+}
+
+async fn fetch_latest_release(proxy_url: String) -> Result<VersionInfo, AppError> {
+    fetch_release_from_api(
+        "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest",
+        proxy_url,
+    )
+    .await
+}
+
+async fn fetch_helper_latest_release(proxy_url: String) -> Result<VersionInfo, AppError> {
+    fetch_release_from_api(HELPER_REPO_API, proxy_url).await
 }
 
 #[tauri::command]
@@ -577,6 +994,172 @@ async fn download_cliproxyapi(
     }))
 }
 
+#[tauri::command]
+async fn check_helper_version_and_download(
+    window: tauri::Window,
+    proxy_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let proxy = proxy_url.unwrap_or_default();
+    let dir = app_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let local = current_helper_info().map_err(|e| e.to_string())?;
+    window
+        .emit("helper-download-status", json!({"status": "checking"}))
+        .ok();
+    let release = fetch_helper_latest_release(proxy.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let latest = normalize_release_version(&release.tag_name);
+
+    if let Some((ver, path)) = local {
+        let cmp = compare_versions(&ver, &latest);
+        if cmp >= 0 {
+            window
+                .emit(
+                    "helper-download-status",
+                    json!({"status": "latest", "version": ver}),
+                )
+                .ok();
+            return Ok(json!(OpResult {
+                success: true,
+                error: None,
+                path: Some(path.to_string_lossy().to_string()),
+                version: Some(ver),
+                needsUpdate: Some(false),
+                isLatest: Some(true),
+                latestVersion: None
+            }));
+        }
+
+        window
+            .emit(
+                "helper-download-status",
+                json!({"status": "update-available", "version": ver, "latest": latest}),
+            )
+            .ok();
+        return Ok(json!(OpResult {
+            success: true,
+            error: None,
+            path: Some(path.to_string_lossy().to_string()),
+            version: Some(ver),
+            needsUpdate: Some(true),
+            isLatest: Some(false),
+            latestVersion: Some(latest)
+        }));
+    }
+
+    Ok(json!(OpResult {
+        success: true,
+        error: None,
+        path: None,
+        version: None,
+        needsUpdate: Some(true),
+        isLatest: Some(false),
+        latestVersion: Some(latest)
+    }))
+}
+
+#[tauri::command]
+async fn download_cpa_helper(
+    window: tauri::Window,
+    proxy_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let proxy = proxy_url.unwrap_or_default();
+    let dir = app_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let release = fetch_helper_latest_release(proxy.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let latest = normalize_release_version(&release.tag_name);
+    let asset = select_helper_asset(&release, std::env::consts::OS, std::env::consts::ARCH)?;
+
+    let download_path = dir.join(&asset.name);
+    window
+        .emit("helper-download-status", json!({"status": "starting"}))
+        .ok();
+
+    let client = parse_proxy(&proxy, reqwest::Client::builder())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&asset.browser_download_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "CPA-Helper download failed, status: {}",
+            resp.status()
+        ));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = fs::File::create(&download_path).map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        downloaded += bytes.len() as u64;
+        let progress = if total > 0 {
+            (downloaded as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        window
+            .emit(
+                "helper-download-progress",
+                json!({"progress": progress, "downloaded": downloaded, "total": total}),
+            )
+            .ok();
+    }
+
+    let extract_path = dir.join(helper_dir_name(&latest));
+    if extract_path.exists() {
+        fs::remove_dir_all(&extract_path).map_err(|e| e.to_string())?;
+    }
+    extract_zip(&download_path, &extract_path).map_err(|e| e.to_string())?;
+    if find_helper_executable(&extract_path).is_none() {
+        let _ = fs::remove_dir_all(&extract_path);
+        let _ = fs::remove_file(&download_path);
+        return Err("CPA-Helper executable file not found after extraction".into());
+    }
+    fs::write(dir.join(HELPER_VERSION_FILE), &latest).map_err(|e| e.to_string())?;
+    fs::create_dir_all(helper_data_dir_from_app_dir(&dir)).map_err(|e| e.to_string())?;
+
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_dir() {
+                    let dir_name = entry.file_name();
+                    let dir_name_str = dir_name.to_string_lossy();
+                    if is_old_helper_dir_name(&dir_name_str, &latest) {
+                        println!("[HELPER][CLEANUP] Removing old version: {}", dir_name_str);
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::remove_file(&download_path);
+
+    window
+        .emit(
+            "helper-download-status",
+            json!({"status": "completed", "version": latest}),
+        )
+        .ok();
+    Ok(json!(OpResult {
+        success: true,
+        error: None,
+        path: Some(extract_path.to_string_lossy().to_string()),
+        version: Some(latest),
+        needsUpdate: None,
+        isLatest: None,
+        latestVersion: None
+    }))
+}
+
 fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), AppError> {
     fs::create_dir_all(dest)?;
     let file = fs::File::open(zip_path)?;
@@ -684,6 +1267,12 @@ fn update_secret_key(args: UpdateSecretKeyArgs) -> Result<serde_json::Value, Str
 #[tauri::command]
 fn read_config_yaml() -> Result<serde_json::Value, String> {
     let dir = app_dir().map_err(|e| e.to_string())?;
+    let version_path = current_local_info()
+        .map_err(|e| e.to_string())?
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| dir.clone());
+    ensure_config(&version_path).map_err(|e| e.to_string())?;
+
     let p = dir.join("config.yaml");
     if !p.exists() {
         return Ok(json!({}));
@@ -1039,7 +1628,9 @@ fn spawn_cliproxyapi_detached(exec: &Path, config: &Path, password: &str) -> Res
             });
         }
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| {
         eprintln!("[CLIProxyAPI][ERROR] failed to start process: {}", e);
         e.to_string()
@@ -1236,7 +1827,11 @@ fn delete_error_log_file(name: String) -> Result<serde_json::Value, String> {
     Ok(json!({ "success": true }))
 }
 
-fn restart_cliproxyapi_process(app: &tauri::AppHandle, port: u16, reason: &str) -> Result<u32, String> {
+fn restart_cliproxyapi_process(
+    app: &tauri::AppHandle,
+    port: u16,
+    reason: &str,
+) -> Result<u32, String> {
     println!(
         "[CLIProxyAPI][RESTART] Triggered by keep-alive. reason={} port={}",
         reason, port
@@ -1256,6 +1851,7 @@ fn restart_cliproxyapi_process(app: &tauri::AppHandle, port: u16, reason: &str) 
 
     let info = current_local_info().map_err(|e| e.to_string())?;
     let (ver, path) = info.ok_or("Version file does not exist")?;
+    ensure_config(&path).map_err(|e| e.to_string())?;
     let exec = find_executable(&path).ok_or("Executable file does not exist")?;
     let config = app_dir().map_err(|e| e.to_string())?.join("config.yaml");
     if !config.exists() {
@@ -1452,6 +2048,248 @@ fn kill_process_on_port(port: u16) -> Result<(), String> {
     Ok(())
 }
 
+fn is_process_running(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid)])
+            .creation_flags(0x08000000)
+            .output();
+        if let Ok(output) = output {
+            return String::from_utf8_lossy(&output.stdout).contains(&pid.to_string());
+        }
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+fn is_tcp_port_open(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+fn helper_health_ok() -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], HELPER_PORT));
+    let mut stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
+    if stream
+        .write_all(
+            format!(
+                "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                HELPER_PORT
+            )
+            .as_bytes(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let head = String::from_utf8_lossy(&buf[..n]);
+            head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+        }
+        _ => false,
+    }
+}
+
+fn find_helper_executable(version_path: &Path) -> Option<PathBuf> {
+    let mut exe = PathBuf::from("cpa-helper");
+    if cfg!(target_os = "windows") {
+        exe.set_extension("exe");
+    }
+    let path = version_path.join(exe);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn spawn_cpa_helper_detached(
+    exec: &Path,
+    working_dir: &Path,
+    data_dir: &Path,
+) -> Result<u32, String> {
+    println!("[CPA-Helper][START] exec: {}", exec.to_string_lossy());
+    println!(
+        "[CPA-Helper][START] env: CPA_HELPER_ADDR=:{} CPA_HELPER_DATA_DIR={}",
+        HELPER_PORT,
+        data_dir.to_string_lossy()
+    );
+
+    let mut cmd = std::process::Command::new(exec);
+    cmd.current_dir(working_dir)
+        .env("CPA_HELPER_ADDR", format!(":{}", HELPER_PORT))
+        .env("CPA_HELPER_DATA_DIR", data_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let child = cmd.spawn().map_err(|e| {
+        eprintln!("[CPA-Helper][ERROR] failed to start process: {}", e);
+        e.to_string()
+    })?;
+    let pid = child.id();
+    drop(child);
+    Ok(pid)
+}
+
+fn start_cpa_helper_internal() -> Result<serde_json::Value, String> {
+    if let Some(pid) = *HELPER_PROCESS_PID.lock() {
+        if is_process_running(pid) {
+            return Ok(json!({
+                "success": true,
+                "message": "already running",
+                "pid": pid,
+                "port": HELPER_PORT
+            }));
+        }
+        *HELPER_PROCESS_PID.lock() = None;
+    }
+
+    if helper_health_ok() {
+        return Ok(json!({
+            "success": true,
+            "message": "already running",
+            "pid": serde_json::Value::Null,
+            "port": HELPER_PORT
+        }));
+    }
+
+    if is_tcp_port_open(HELPER_PORT) {
+        return Ok(json!({
+            "success": false,
+            "error": format!("CPA-Helper port {} is occupied by another process", HELPER_PORT)
+        }));
+    }
+
+    let info = current_helper_info().map_err(|e| e.to_string())?;
+    let (ver, path) = match info {
+        Some(info) => info,
+        None => {
+            return Ok(json!({
+                "success": false,
+                "error": "CPA-Helper not installed"
+            }));
+        }
+    };
+    let exec = find_helper_executable(&path).ok_or("CPA-Helper executable file does not exist")?;
+    let dir = app_dir().map_err(|e| e.to_string())?;
+    let data_dir = helper_data_dir_from_app_dir(&dir);
+    fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+
+    let pid = spawn_cpa_helper_detached(&exec, &path, &data_dir)?;
+    *HELPER_PROCESS_PID.lock() = Some(pid);
+    println!("[CPA-Helper][START] Detached process with PID: {}", pid);
+
+    Ok(json!({
+        "success": true,
+        "version": ver,
+        "pid": pid,
+        "port": HELPER_PORT
+    }))
+}
+
+fn try_start_helper_background(app: &tauri::AppHandle) {
+    match current_helper_info() {
+        Ok(Some(_)) => match start_cpa_helper_internal() {
+            Ok(value) => {
+                if value
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    println!("[CPA-Helper][START] Background start ok: {}", value);
+                } else {
+                    let msg = value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("CPA-Helper start failed");
+                    eprintln!("[CPA-Helper][WARN] Background start failed: {}", msg);
+                    let _ = app.emit("cpa-helper-start-error", json!({"message": msg}));
+                }
+            }
+            Err(e) => {
+                eprintln!("[CPA-Helper][WARN] Background start failed: {}", e);
+                let _ = app.emit("cpa-helper-start-error", json!({"message": e}));
+            }
+        },
+        Ok(None) => {
+            println!("[CPA-Helper][START] Helper not installed, skip background start");
+        }
+        Err(e) => {
+            eprintln!(
+                "[CPA-Helper][WARN] Unable to check helper installation: {}",
+                e
+            );
+        }
+    }
+}
+
+#[tauri::command]
+fn start_cpa_helper() -> Result<serde_json::Value, String> {
+    start_cpa_helper_internal()
+}
+
+#[tauri::command]
+fn restart_cpa_helper() -> Result<serde_json::Value, String> {
+    if let Some(pid) = *HELPER_PROCESS_PID.lock() {
+        println!("[CPA-Helper][RESTART] Killing old process PID: {}", pid);
+        kill_process_by_pid(pid);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    *HELPER_PROCESS_PID.lock() = None;
+
+    if let Err(e) = kill_process_on_port(HELPER_PORT) {
+        eprintln!("[CPA-Helper][PORT_CLEANUP] Warning: {}", e);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    start_cpa_helper_internal()
+}
+
+#[tauri::command]
+fn stop_cpa_helper() -> Result<serde_json::Value, String> {
+    if let Some(pid) = *HELPER_PROCESS_PID.lock() {
+        println!("[CPA-Helper][STOP] Killing process PID: {}", pid);
+        kill_process_by_pid(pid);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    *HELPER_PROCESS_PID.lock() = None;
+
+    if let Err(e) = kill_process_on_port(HELPER_PORT) {
+        eprintln!("[CPA-Helper][PORT_CLEANUP] Warning: {}", e);
+    }
+
+    Ok(json!({
+        "success": true,
+        "port": HELPER_PORT
+    }))
+}
+
 #[tauri::command]
 fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     // Check if already running by testing PID
@@ -1471,11 +2309,11 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
                     if let Ok(cfg_path) = app_dir().map(|p| p.join("config.yaml")) {
                         if cfg_path.exists() {
                             if let Ok(content) = fs::read_to_string(&cfg_path) {
-                                if let Ok(conf) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                                    port = conf
-                                        .get("port")
-                                        .and_then(|v| v.as_u64())
-                                        .map(|v| v as u16);
+                                if let Ok(conf) =
+                                    serde_yaml::from_str::<serde_yaml::Value>(&content)
+                                {
+                                    port =
+                                        conf.get("port").and_then(|v| v.as_u64()).map(|v| v as u16);
                                     password = extract_secret_key(&conf);
                                 }
                             }
@@ -1488,6 +2326,7 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
                     if let Some(p) = port {
                         let _ = start_keep_alive(app.clone(), p);
                     }
+                    try_start_helper_background(&app);
 
                     return Ok(json!({
                         "success": true,
@@ -1508,11 +2347,11 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
                     if let Ok(cfg_path) = app_dir().map(|p| p.join("config.yaml")) {
                         if cfg_path.exists() {
                             if let Ok(content) = fs::read_to_string(&cfg_path) {
-                                if let Ok(conf) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                                    port = conf
-                                        .get("port")
-                                        .and_then(|v| v.as_u64())
-                                        .map(|v| v as u16);
+                                if let Ok(conf) =
+                                    serde_yaml::from_str::<serde_yaml::Value>(&content)
+                                {
+                                    port =
+                                        conf.get("port").and_then(|v| v.as_u64()).map(|v| v as u16);
                                     password = extract_secret_key(&conf);
                                 }
                             }
@@ -1525,6 +2364,7 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
                     if let Some(p) = port {
                         let _ = start_keep_alive(app.clone(), p);
                     }
+                    try_start_helper_background(&app);
 
                     return Ok(json!({
                         "success": true,
@@ -1539,6 +2379,7 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
 
     let info = current_local_info().map_err(|e| e.to_string())?;
     let (_ver, path) = info.ok_or("Version file does not exist")?;
+    ensure_config(&path).map_err(|e| e.to_string())?;
     let exec = find_executable(&path).ok_or("Executable file does not exist")?;
     let config = app_dir().map_err(|e| e.to_string())?.join("config.yaml");
     if !config.exists() {
@@ -1570,12 +2411,17 @@ fn start_cliproxyapi(app: tauri::AppHandle) -> Result<serde_json::Value, String>
 
     // Start keep-alive mechanism for Local mode
     let _ = start_keep_alive(app.clone(), port);
+    try_start_helper_background(&app);
 
     Ok(json!({"success": true, "password": password, "pid": pid}))
 }
 
 #[tauri::command]
 fn restart_cliproxyapi(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some((_ver, path)) = current_local_info().map_err(|e| e.to_string())? {
+        ensure_config(&path).map_err(|e| e.to_string())?;
+    }
+
     let config = app_dir().map_err(|e| e.to_string())?.join("config.yaml");
     if !config.exists() {
         return Err("Configuration file does not exist".into());
@@ -1594,6 +2440,49 @@ fn restart_cliproxyapi(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn stop_cliproxyapi() -> Result<serde_json::Value, String> {
+    if let Some((_ver, path)) = current_local_info().map_err(|e| e.to_string())? {
+        ensure_config(&path).map_err(|e| e.to_string())?;
+    }
+
+    let config = app_dir().map_err(|e| e.to_string())?.join("config.yaml");
+    let default_port = if is_debug_cpa_mode() {
+        DEBUG_CPA_PORT
+    } else {
+        8317
+    };
+    let port = if config.exists() {
+        let content = fs::read_to_string(&config).map_err(|e| e.to_string())?;
+        let conf: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
+        conf.get("port")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u16)
+            .unwrap_or(default_port)
+    } else {
+        default_port
+    };
+
+    if let Some(pid) = *PROCESS_PID.lock() {
+        println!("[CLIProxyAPI][STOP] Killing process PID: {}", pid);
+        kill_process_by_pid(pid);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    *PROCESS_PID.lock() = None;
+
+    if let Err(e) = kill_process_on_port(port) {
+        eprintln!("[CLIProxyAPI][PORT_CLEANUP] Warning: {}", e);
+    }
+
+    stop_keep_alive_internal();
+    *CLI_PROXY_PASSWORD.lock() = None;
+
+    Ok(json!({
+        "success": true,
+        "port": port
+    }))
+}
+
 fn stop_process_internal() {
     // Process is detached, don't try to kill it
     // Just stop keep-alive mechanism
@@ -1608,8 +2497,8 @@ fn stop_process_internal() {
 fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::{
         menu::{MenuBuilder, MenuItemBuilder},
-        tray::TrayIconEvent,
         tray::TrayIconBuilder,
+        tray::TrayIconEvent,
     };
     let mut guard = TRAY_ICON.lock();
     if guard.is_some() {
@@ -2198,6 +3087,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             check_version_and_download,
             download_cliproxyapi,
+            check_helper_version_and_download,
+            download_cpa_helper,
             check_secret_key,
             update_secret_key,
             read_config_yaml,
@@ -2209,6 +3100,10 @@ fn main() {
             download_local_auth_files,
             restart_cliproxyapi,
             start_cliproxyapi,
+            stop_cliproxyapi,
+            restart_cpa_helper,
+            start_cpa_helper,
+            stop_cpa_helper,
             get_cpa_output_tail,
             clear_cpa_output_tail,
             list_error_log_files,
@@ -2272,7 +3167,12 @@ fn save_files_to_directory(files: Vec<SaveFile>) -> Result<serde_json::Value, St
 
 // Keep-alive mechanism functions
 
-fn run_keep_alive_loop(stop: Arc<AtomicBool>, app: tauri::AppHandle, port: u16, mut password: String) {
+fn run_keep_alive_loop(
+    stop: Arc<AtomicBool>,
+    app: tauri::AppHandle,
+    port: u16,
+    mut password: String,
+) {
     println!("[KEEP-ALIVE] Starting keep-alive loop for port {}", port);
 
     // Create a tokio runtime for async operations
@@ -2297,9 +3197,7 @@ fn run_keep_alive_loop(stop: Arc<AtomicBool>, app: tauri::AppHandle, port: u16, 
 
     let mut consecutive_failures: u32 = 0;
     let now = std::time::Instant::now();
-    let mut last_restart = now
-        .checked_sub(Duration::from_secs(3600))
-        .unwrap_or(now);
+    let mut last_restart = now.checked_sub(Duration::from_secs(3600)).unwrap_or(now);
 
     while !stop.load(Ordering::SeqCst) {
         // Send keep-alive request
@@ -2337,7 +3235,9 @@ fn run_keep_alive_loop(stop: Arc<AtomicBool>, app: tauri::AppHandle, port: u16, 
                         if let Ok(dir) = app_dir() {
                             let p = dir.join("config.yaml");
                             if let Ok(content) = fs::read_to_string(&p) {
-                                if let Ok(conf) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                                if let Ok(conf) =
+                                    serde_yaml::from_str::<serde_yaml::Value>(&content)
+                                {
                                     if let Some(sk) = extract_secret_key(&conf) {
                                         if sk != password {
                                             println!("[KEEP-ALIVE] Detected secret-key change, reloading");
@@ -2349,7 +3249,8 @@ fn run_keep_alive_loop(stop: Arc<AtomicBool>, app: tauri::AppHandle, port: u16, 
                                 }
                             }
                         }
-                    } else if status.is_server_error() || status == reqwest::StatusCode::BAD_GATEWAY {
+                    } else if status.is_server_error() || status == reqwest::StatusCode::BAD_GATEWAY
+                    {
                         consecutive_failures += 1;
                     }
                 }

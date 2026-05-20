@@ -55,24 +55,28 @@
                 <div class="settings-form">
                     <div class="setting-item" id="quick-actions-setting">
                         <div class="setting-label">
-                            <label>快捷操作</label>
-                            <span class="setting-description">更新/重启 CPA、打开管理页面</span>
+                            <label></label>
                         </div>
-                        <div class="setting-control" style="display:flex; gap:10px; flex-wrap:wrap;">
+                        <div class="setting-control quick-actions-grid">
                             <button type="button" class="btn-cancel" id="open-management-btn">打开管理页面</button>
                             <button type="button" class="btn-save local-only" id="update-cpa-btn">更新 CPA</button>
                             <button type="button" class="btn-cancel local-only" id="restart-cpa-btn">重启 CPA</button>
+                            <button type="button" class="btn-cancel local-only" id="stop-cpa-btn">关闭 CPA</button>
+                            <button type="button" class="btn-cancel local-only" id="open-helper-btn">打开 Helper 页面</button>
+                            <button type="button" class="btn-save local-only" id="update-helper-btn">更新 Helper</button>
+                            <button type="button" class="btn-cancel local-only" id="restart-helper-btn">重启 Helper</button>
+                            <button type="button" class="btn-cancel local-only" id="stop-helper-btn">关闭 Helper</button>
                         </div>
                     </div>
                     <!-- Local Mode Only Settings -->
                     <div class="setting-item local-only" id="port-setting">
                         <div class="setting-label">
                             <label for="port-input">端口</label>
-                            <span class="setting-description">服务端口号（默认：8080）</span>
+                            <span class="setting-description">服务端口号（从 config.yaml 读取）</span>
                         </div>
                         <div class="setting-control">
                             <input type="number" id="port-input" class="number-input" min="1" max="65535"
-                                placeholder="8080">
+                                placeholder="8317">
                         </div>
                     </div>
 

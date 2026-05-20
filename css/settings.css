@@ -265,6 +265,19 @@ body {
     margin-left: 20px;
 }
 
+.quick-actions-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(110px, 1fr));
+    gap: 10px;
+    min-width: 510px;
+}
+
+.quick-actions-grid button {
+    justify-content: center;
+    min-width: 110px;
+    white-space: nowrap;
+}
+
 /* Switch Styles */
 .switch {
     position: relative;

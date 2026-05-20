@@ -1,6 +1,6 @@
 [package]
 name = "easycli"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 
 [build-dependencies]
@@ -33,4 +33,5 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+
 

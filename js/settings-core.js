@@ -49,10 +49,10 @@ async function initializeProxyUrl() {
 async function initializePort() {
     try {
         const config = await configManager.getConfig();
-        portInput.value = config.port || 8080;
+        portInput.value = config.port || 8317;
     } catch (error) {
         console.error('Error loading config:', error);
-        portInput.value = 8080;
+        portInput.value = 8317;
     }
 }
 
@@ -219,7 +219,7 @@ async function applyAllSettings() {
 
             const connectionType = localStorage.getItem('type') || 'local';
             if (connectionType === 'local') {
-                const serverPort = serverConfig.port || 8080;
+                const serverPort = serverConfig.port || 8317;
                 if (parseInt(portInput.value) !== serverPort) {
                     changes.push({ endpoint: 'port', value: parseInt(portInput.value) });
                 }
@@ -368,7 +368,7 @@ async function resetAllSettings() {
 
             const connectionType = localStorage.getItem('type') || 'local';
             if (connectionType === 'local') {
-                portInput.value = serverConfig.port || 8080;
+                portInput.value = serverConfig.port || 8317;
                 const serverRemoteManagement = serverConfig['remote-management'] || {};
                 allowRemoteSwitch.checked = serverRemoteManagement['allow-remote'] || false;
                 secretKeyInput.value = '';
