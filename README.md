@@ -2,7 +2,7 @@
 
 [中文文档 | Chinese Version](README_CN.md)
 
-EasyCLI is a Tauri v2-based desktop GUI for managing and operating CLIProxyAPI in Local or Remote mode. Recent updates migrate the app from Electron to Tauri, add a system tray with hide-to-tray behavior, and introduce proxy support during the local download/update flow.
+EasyCLI is a Tauri v2-based desktop GUI for managing and operating CLIProxyAPI in Local or Remote mode. Recent updates migrate the app from Electron to Tauri, add a system tray with hide-to-tray behavior, introduce proxy support during the local download/update flow, integrate CPA-Helper background management, and add CPA statistics/quota visibility.
 
 Upstream project: https://github.com/router-for-me/CLIProxyAPI
 
@@ -25,18 +25,23 @@ This repo includes additional updates built on top of https://github.com/router-
   - “CLIProxyAPI output” viewer: tail, auto-refresh, copy, and clear.
   - “Error logs” viewer: list/select, tail view, copy, delete current file, and delete all log files.
 - Maintenance actions
-  - Buttons to: open `.../management.html`, update CPA (download/install flow), and restart CPA.
+  - CPA buttons: open `.../management.html`, update, restart, and stop the local CPA process.
+  - CPA-Helper buttons: open the Helper page, update from `walkingddd/CPA-Helper` releases, restart, and stop the Helper process.
+- CPA statistics
+  - Added CPA statistics/quota views for authentication status, Codex usage, Gemini quota buckets, and Antigravity model availability.
 - Auth files UX
   - Drag-and-drop upload for auth JSON files (Tauri drag-drop events on desktop).
 
 ## Features
 - Local and Remote modes with quick switching.
 - Auto-detect, download, and extract the latest CLIProxyAPI release per OS/arch.
+- Auto-detect, download, extract, start, restart, and stop CPA-Helper on Windows.
 - Version tracking under `~/cliproxyapi` and automatic config bootstrap.
 - Secure remote management via password (secret key).
 - System tray: Open Settings and Quit; closing the window hides to tray when the local process is running.
 - Settings UI:
-  - Basic: debug, port (Local), proxy URL, request logs, request retry, remote management options.
+  - Basic: debug, port (Local), proxy URL, request logs, request retry, remote management options, CPA maintenance buttons, and CPA-Helper maintenance buttons.
+  - CPA Statistics / Quota Management: authentication status plus Codex, Gemini, and Antigravity usage/quota data.
   - Access Token: manage general API access tokens.
   - Authentication Files: list/upload/download/delete JSON auth files (honors `auth-dir` with `~` and relative paths).
   - Third Party API Keys: Gemini, Codex, Claude Code.
@@ -47,7 +52,7 @@ This repo includes additional updates built on top of https://github.com/router-
 - Frontend: static HTML/CSS + vanilla JS in `login.html`, `settings.html`, and `js/*`.
 - Backend: Rust (Tauri v2) in `src-tauri/src/main.rs` exposing commands to the frontend via Tauri `invoke`.
 - Packaging: Tauri bundler per `src-tauri/tauri.conf.json` (targets: dmg/app, nsis, deb).
-- Data directory: `~/cliproxyapi` holds the installed CLI and configuration.
+- Data directory: `~/cliproxyapi` holds the installed CPA, CPA-Helper, configuration, and Helper data. Debug builds use `~/cliproxyapi-debug`.
 
 ### Release Download Logic
 - Checks GitHub API: `/repos/router-for-me/CLIProxyAPI/releases/latest`.
@@ -58,6 +63,8 @@ This repo includes additional updates built on top of https://github.com/router-
   - Windows amd64: `CLIProxyAPI_<ver>_windows_amd64.zip`
   - Windows arm64: `CLIProxyAPI_<ver>_windows_arm64.zip`
 - Extracts to `~/cliproxyapi/<version>/`, writes `~/cliproxyapi/version.txt`, and ensures `config.yaml` (copied from `config.example.yaml` if present).
+- CPA-Helper checks GitHub API: `/repos/walkingddd/CPA-Helper/releases/latest`; Windows assets are downloaded as `cpa-helper_<tag>_windows_amd64.zip` or `cpa-helper_<tag>_windows_aarch64.zip`.
+- CPA-Helper extracts to `~/cliproxyapi/helper-<version>/`, writes `~/cliproxyapi/helper-version.txt`, and keeps runtime data under `~/cliproxyapi/helper-data`.
 - Optional proxy for GitHub downloads: supports `http://`, `https://`, `socks5://` (with or without auth).
 
 ### System Tray & Window Behavior
@@ -92,17 +99,21 @@ Artifacts are placed under `src-tauri/target/release/bundle/` (e.g., `.dmg`/`.ap
 - Local Mode
   - Optionally set a proxy in the login screen to download via HTTP/HTTPS/SOCKS5.
   - If the CLI is missing/outdated, confirm update; progress is shown.
+  - After CPA version checks, CPA-Helper version checks run in the same startup process; updates require confirmation and show progress.
   - When prompted, set `remote-management.secret-key` for management endpoints.
-  - The app starts and monitors the local process; tray remains available.
+  - The app starts and monitors the local CPA process, then starts installed CPA-Helper in the background. The tray remains available.
 - Remote Mode
   - Enter Base URL (e.g., `http://server:8317`) and management password.
   - The GUI reads and updates config via `/v0/management/...` endpoints.
 
 ## Data & Paths
-- Root: `~/cliproxyapi`
-  - `version.txt`: current version.
-  - `<version>/`: extracted CLI build (`cli-proxy-api` or `cli-proxy-api.exe`).
-  - `config.yaml`: active configuration; created from `config.example.yaml` if available.
+- Release root: `~/cliproxyapi`; debug build root: `~/cliproxyapi-debug`.
+  - `version.txt`: current CPA version.
+  - `<version>/`: extracted CPA build (`cli-proxy-api` or `cli-proxy-api.exe`).
+  - `config.yaml`: active configuration; created from `config.example.yaml` if available. In debug builds, the root-level `port` is kept at `8318`.
+  - `helper-version.txt`: current CPA-Helper version.
+  - `helper-<version>/`: extracted CPA-Helper build (`cpa-helper.exe`).
+  - `helper-data/`: CPA-Helper runtime data, including SQLite data.
 - Auth files dir: from `config.yaml` key `auth-dir`; supports `~`, absolute, and relative paths (relative to `config.yaml`).
 
 ## Troubleshooting
@@ -110,14 +121,15 @@ Artifacts are placed under `src-tauri/target/release/bundle/` (e.g., `.dmg`/`.ap
 - Asset not found: ensure your OS/arch matches the expected filenames listed above.
 - Callback server port in use: Gemini(8085)/Claude(54545)/Codex(1455) must be free; close conflicting apps or retry.
 - Hidden to tray: use the tray menu to re-open Settings or Quit.
-- Config errors: ensure `version.txt` and `config.yaml` exist under `~/cliproxyapi` (Local mode bootstraps them).
+- CPA-Helper not starting: run Update Helper from Basic settings, then open `http://127.0.0.1:18317`.
+- Config errors: ensure `version.txt` and `config.yaml` exist under `~/cliproxyapi` (Local mode bootstraps them). Debug builds use `~/cliproxyapi-debug`.
 
 ## Project Layout (overview)
 - `src-tauri/src/main.rs`: Tauri backend (downloads, config/auth-file ops, process + tray, callback helper).
 - `src-tauri/tauri.conf.json`: Tauri configuration and bundler targets.
 - `src-tauri/prepare-web.js` / `src-tauri/watch-web.js`: copy/watch static web assets to `dist-web/`.
 - `login.html` + `js/login.js`: mode selection, proxy + update/install flow.
-- `settings.html` + `js/settings-*.js`: settings UI (basic, tokens, API keys, OpenAI providers, auth files).
+- `settings.html` + `js/settings-*.js`: settings UI (basic, CPA statistics/quota, tokens, API keys, OpenAI providers, auth files, CPA/Helper maintenance).
 - `css/` and `images/`: UI styles and icons.
 
 ## Security Notes
